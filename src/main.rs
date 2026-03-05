@@ -23,11 +23,11 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::time::Instant;
 
-/// aydee — Active Directory Enumeration Tool
+/// AyDee — Active Directory Enumeration Tool
 #[derive(Parser, Debug)]
 #[command(
     name = "aydee",
-    about = "Active Directory enumeration tool",
+    about = "AyDee - Active Directory Enumeration Tool",
     version,
     styles = cli_styles(),
     before_help = "\x1b[1;31m\n                  _\n   __ _ _   _  __| | ___  ___\n  / _` | | | |/ _` |/ _ \\/ _ \\\n | (_| | |_| | (_| |  __/  __/\n  \\__,_|\\__, |\\__,_|\\___|\\___|\n        |___/\n\x1b[0m",

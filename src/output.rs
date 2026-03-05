@@ -1,6 +1,6 @@
 use colored::*;
 
-/// Print the aydee banner
+/// Print the AyDee banner
 pub fn banner() {
     let banner = r#"
                   _            
@@ -13,7 +13,7 @@ pub fn banner() {
     println!("{}", banner.bright_red().bold());
     println!(
         "  {} {}\n",
-        "Active Directory Enumeration Tool".white().bold(),
+        "AyDee - Active Directory Enumeration Tool".white().bold(),
         "v0.1.0".bright_black()
     );
 }
