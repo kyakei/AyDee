@@ -12,7 +12,7 @@ mod rpc;
 mod scanner;
 mod smb;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::builder::styling::{AnsiColor, Effects, Styles};
 use clap::Parser;
 use colored::*;
@@ -31,14 +31,14 @@ use std::time::Instant;
     version,
     styles = cli_styles(),
     before_help = "\x1b[1;31m\n                  _\n   __ _ _   _  __| | ___  ___\n  / _` | | | |/ _` |/ _ \\/ _ \\\n | (_| | |_| | (_| |  __/  __/\n  \\__,_|\\__, |\\__,_|\\___|\\___|\n        |___/\n\x1b[0m",
-    after_help = "Examples\n  Basic:       aydee 10.10.10.100\n  Custom scan: aydee 10.10.10.100 -p 389,636,8080\n  All ports:   aydee 10.10.10.100 -p- --timeout 3\n  Password:    aydee 10.10.10.100 -d corp.local -u alice -P 'Password123!'\n  NTLM:        aydee 10.10.10.100 -d corp.local -u alice -H aad3b435b51404eeaad3b435b51404ee:11223344556677889900aabbccddeeff\n  CCache:      aydee 10.10.10.100 --ccache ./alice.ccache -k -u alice\n  BH:          aydee 10.10.10.100 --collection All -u alice -k --ccache ./alice.ccache"
+    after_help = "Examples\n  Basic:       aydee 10.10.10.100\n  Custom scan: aydee 10.10.10.100 -P 389,636,8080\n  All ports:   aydee 10.10.10.100 -P- --timeout 3\n  Password:    aydee 10.10.10.100 -d corp.local -u alice -p 'Password123!'\n  NTLM:        aydee 10.10.10.100 -d corp.local -u alice -H aad3b435b51404eeaad3b435b51404ee:11223344556677889900aabbccddeeff\n  CCache:      aydee 10.10.10.100 --ccache ./alice.ccache -k -u alice\n  BH:          aydee 10.10.10.100 --collection All -u alice -k --ccache ./alice.ccache"
 )]
 struct Args {
     /// Target IP address
     target: String,
 
     /// Custom ports to scan (e.g., "389,636" or "80-100" or "-" for all)
-    #[arg(short, long, help_heading = "Scan")]
+    #[arg(short = 'P', long, help_heading = "Scan")]
     ports: Option<String>,
 
     /// Connection timeout in seconds
@@ -62,7 +62,7 @@ struct Args {
     username: Option<String>,
 
     /// Password for authenticated AD recon
-    #[arg(short = 'P', long = "password", visible_alias = "auth-pass", help_heading = "Authentication")]
+    #[arg(short = 'p', long = "password", visible_alias = "auth-pass", help_heading = "Authentication")]
     password: Option<String>,
 
     /// NTLM hash for authenticated AD recon (NTHASH or LMHASH:NTHASH)
@@ -136,7 +136,9 @@ async fn main() -> Result<()> {
     clock::maybe_fix_clock_skew(&args.target, !args.no_fix_clock_skew).await;
 
     // Phase 1: Port scan
-    let results = scanner::run(&args.target, args.ports.as_deref(), args.timeout).await?;
+    let results = scanner::run(&args.target, args.ports.as_deref(), args.timeout)
+        .await
+        .context("Invalid --ports value (examples: 389,636 | 80-100 | -)")?;
 
     let open_ports: Vec<u16> = results.iter().filter(|r| r.open).map(|r| r.port).collect();
 

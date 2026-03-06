@@ -65,6 +65,7 @@ pub struct PortResult {
 /// Parse a port specification string
 /// Supports: "80", "80,443", "80-100", "80,443,8000-8100", "-" (all ports)
 pub fn parse_ports(spec: &str) -> Result<Vec<u16>> {
+    let spec = spec.trim();
     if spec == "-" {
         return Ok((1..=65535).collect());
     }
@@ -72,17 +73,36 @@ pub fn parse_ports(spec: &str) -> Result<Vec<u16>> {
     let mut ports = Vec::new();
     for part in spec.split(',') {
         let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
         if part.contains('-') {
             let range: Vec<&str> = part.split('-').collect();
             if range.len() != 2 {
                 anyhow::bail!("Invalid port range: {}", part);
             }
-            let start: u16 = range[0].parse()?;
-            let end: u16 = range[1].parse()?;
+            let start: u16 = range[0]
+                .trim()
+                .parse()
+                .map_err(|_| anyhow::anyhow!("Invalid start port in range: {}", part))?;
+            let end: u16 = range[1]
+                .trim()
+                .parse()
+                .map_err(|_| anyhow::anyhow!("Invalid end port in range: {}", part))?;
+            if start > end {
+                anyhow::bail!("Invalid port range (start > end): {}", part);
+            }
             ports.extend(start..=end);
         } else {
-            ports.push(part.parse()?);
+            let port: u16 = part
+                .parse()
+                .map_err(|_| anyhow::anyhow!("Invalid port value: {}", part))?;
+            ports.push(port);
         }
+    }
+
+    if ports.is_empty() {
+        anyhow::bail!("No valid ports provided in --ports specification");
     }
 
     Ok(ports)

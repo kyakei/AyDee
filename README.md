@@ -31,13 +31,13 @@ Examples:
 aydee 10.10.10.100
 
 # custom ports
-aydee 10.10.10.100 -p 389,636,8080
+aydee 10.10.10.100 -P 389,636,8080
 
 # all ports
-aydee 10.10.10.100 -p- --timeout 3
+aydee 10.10.10.100 -P- --timeout 3
 
 # password auth
-aydee 10.10.10.100 -d corp.local -u alice -P 'Password123!'
+aydee 10.10.10.100 -d corp.local -u alice -p 'Password123!'
 
 # NTLM auth
 aydee 10.10.10.100 -d corp.local -u alice -H aad3b435b51404eeaad3b435b51404ee:11223344556677889900aabbccddeeff
@@ -53,7 +53,7 @@ aydee 10.10.10.100 --collection All -u alice -k --ccache ./alice.ccache
 
 ### Scan
 
-- `-p, --ports <PORTS>` custom ports (`389,636`, ranges like `80-100`, or `-` for all)
+- `-P, --ports <PORTS>` custom ports (`389,636`, ranges like `80-100`, or `-` for all)
 - `-t, --timeout <TIMEOUT>` connection timeout seconds (default `2`)
 - `--no-fix-clock-skew` disable startup clock skew fix helper
 - `-d, --domain <DOMAIN>` domain hint (otherwise auto-discovered)
@@ -62,7 +62,7 @@ aydee 10.10.10.100 --collection All -u alice -k --ccache ./alice.ccache
 ### Authentication
 
 - `-u, --username <USERNAME>` username
-- `-P, --password <PASSWORD>` password
+- `-p, --password <PASSWORD>` password
 - `-H, --ntlm <NTLM>` NTHASH or LMHASH:NTHASH
 - `-k, --kerberos` enable Kerberos auth mode for external collectors
 - `--ccache <CCACHE>` Kerberos ticket cache path (sets `KRB5CCNAME`)

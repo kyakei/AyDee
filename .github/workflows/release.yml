@@ -19,13 +19,10 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            archive_ext: tar.gz
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            archive_ext: tar.gz
+            binary_path: target/release/aydee
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            archive_ext: zip
+            binary_path: target/release/aydee.exe
 
     steps:
       - name: Checkout
@@ -40,31 +37,11 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked
 
-      - name: Package (unix)
-        if: runner.os != 'Windows'
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p dist
-          NAME="aydee-${GITHUB_REF_NAME}-${{ matrix.target }}"
-          cp target/release/aydee "$NAME"
-          tar -czf "dist/${NAME}.tar.gz" "$NAME"
-
-      - name: Package (windows)
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p dist
-          NAME="aydee-${GITHUB_REF_NAME}-${{ matrix.target }}"
-          cp target/release/aydee.exe "${NAME}.exe"
-          7z a "dist/${NAME}.zip" "${NAME}.exe"
-
-      - name: Upload packaged artifact
+      - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
-          path: dist/*
+          path: ${{ matrix.binary_path }}
 
   release:
     name: Publish GitHub Release
@@ -73,20 +50,27 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
 
     steps:
-      - name: Download all packaged artifacts
+      - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
-          path: dist
-          merge-multiple: true
+          path: artifacts
 
-      - name: Generate checksums
+      - name: Prepare release binaries
         run: |
-          cd dist
-          sha256sum * > SHA256SUMS.txt
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          mkdir -p dist
+
+          cp "artifacts/x86_64-unknown-linux-gnu/aydee" "dist/aydee-${TAG}-linux-x86_64"
+          chmod +x "dist/aydee-${TAG}-linux-x86_64"
+
+          cp "artifacts/x86_64-pc-windows-msvc/aydee.exe" "dist/aydee-${TAG}-windows-x86_64.exe"
 
       - name: Publish release assets
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/*
+            dist/aydee-*-linux-x86_64
+            dist/aydee-*-windows-x86_64.exe
+          overwrite_files: true
           generate_release_notes: true
