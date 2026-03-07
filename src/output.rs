@@ -49,11 +49,12 @@ pub fn section(title: &str) {
 
 /// Print a key-value pair with formatting
 pub fn kv(key: &str, value: &str) {
+    let rendered = compact_value(value, 260);
     println!(
         "    {} {} {}",
         "›".bright_black(),
         format!("{:<24}", key).bright_cyan(),
-        value.white()
+        rendered.white()
     );
 }
 
@@ -84,4 +85,20 @@ pub fn summary(open: usize, closed: usize) {
         format!("{}", open).green().bold(),
         format!("{}", closed).bright_black()
     );
+}
+
+fn compact_value(input: &str, max_chars: usize) -> String {
+    let collapsed = input
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_string();
+
+    if collapsed.chars().count() <= max_chars {
+        return collapsed;
+    }
+
+    let clipped = collapsed.chars().take(max_chars).collect::<String>();
+    format!("{} <snip>", clipped)
 }
