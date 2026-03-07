@@ -1,5 +1,4 @@
 use anyhow::Result;
-use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
@@ -9,24 +8,24 @@ use crate::output;
 
 /// Default AD-related ports to scan
 const DEFAULT_PORTS: &[u16] = &[
-    80,    // HTTP (AD CS web enrollment / NTLM over HTTP)
-    53,    // DNS
-    88,    // Kerberos
-    443,   // HTTPS (AD CS web enrollment)
-    135,   // MSRPC
-    139,   // NetBIOS
-    389,   // LDAP
-    445,   // SMB
-    464,   // Kerberos kpasswd
-    593,   // HTTP RPC
-    636,   // LDAPS
-    3268,  // Global Catalog
-    3269,  // Global Catalog SSL
-    5985,  // WinRM HTTP
-    5986,  // WinRM HTTPS
-    8080,  // Alternate HTTP
-    8443,  // Alternate HTTPS
-    9389,  // AD Web Services
+    80,   // HTTP (AD CS web enrollment / NTLM over HTTP)
+    53,   // DNS
+    88,   // Kerberos
+    443,  // HTTPS (AD CS web enrollment)
+    135,  // MSRPC
+    139,  // NetBIOS
+    389,  // LDAP
+    445,  // SMB
+    464,  // Kerberos kpasswd
+    593,  // HTTP RPC
+    636,  // LDAPS
+    3268, // Global Catalog
+    3269, // Global Catalog SSL
+    5985, // WinRM HTTP
+    5986, // WinRM HTTPS
+    8080, // Alternate HTTP
+    8443, // Alternate HTTPS
+    9389, // AD Web Services
 ];
 
 /// Well-known AD service names by port
@@ -110,10 +109,9 @@ pub fn parse_ports(spec: &str) -> Result<Vec<u16>> {
 
 /// Scan a single port via TCP connect
 async fn scan_port(ip: &str, port: u16, timeout_secs: u64) -> PortResult {
-    let addr: SocketAddr = format!("{}:{}", ip, port).parse().unwrap();
     let is_open = timeout(
         Duration::from_secs(timeout_secs),
-        TcpStream::connect(&addr),
+        TcpStream::connect((ip, port)),
     )
     .await
     .map(|r| r.is_ok())
@@ -127,18 +125,18 @@ async fn scan_port(ip: &str, port: u16, timeout_secs: u64) -> PortResult {
 }
 
 /// Run a port scan against the target
-pub async fn run(ip: &str, custom_ports: Option<&str>, timeout_secs: u64) -> Result<Vec<PortResult>> {
+pub async fn run(
+    ip: &str,
+    custom_ports: Option<&str>,
+    timeout_secs: u64,
+) -> Result<Vec<PortResult>> {
     let ports = match custom_ports {
         Some(spec) => parse_ports(spec)?,
         None => DEFAULT_PORTS.to_vec(),
     };
 
     output::section("PORT SCAN");
-    output::info(&format!(
-        "Scanning {} ports on {}",
-        ports.len(),
-        ip
-    ));
+    output::info(&format!("Scanning {} ports on {}", ports.len(), ip));
 
     let semaphore = std::sync::Arc::new(Semaphore::new(200)); // max 200 concurrent connections
     let mut handles = Vec::new();
@@ -183,4 +181,23 @@ pub async fn run(ip: &str, custom_ports: Option<&str>, timeout_secs: u64) -> Res
     output::summary(open_count, closed_count);
 
     Ok(results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_ports;
+
+    #[test]
+    fn parses_all_ports_marker() {
+        let ports = parse_ports("-").expect("all ports spec should parse");
+        assert_eq!(ports.first(), Some(&1));
+        assert_eq!(ports.last(), Some(&65535));
+        assert_eq!(ports.len(), 65535);
+    }
+
+    #[test]
+    fn rejects_invalid_range() {
+        let err = parse_ports("100-80").expect_err("reversed range should fail");
+        assert!(err.to_string().contains("start > end"));
+    }
 }

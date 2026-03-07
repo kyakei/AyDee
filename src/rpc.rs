@@ -21,7 +21,10 @@ pub async fn run(target: &str) -> Result<()> {
                 output::success(&format!("Found {} RPC endpoints", eps.len()));
                 println!();
                 for ep in &eps {
-                    output::kv(&ep.protocol, &format!("{} — {}", ep.endpoint, ep.annotation));
+                    output::kv(
+                        &ep.protocol,
+                        &format!("{} — {}", ep.endpoint, ep.annotation),
+                    );
                 }
                 if eps.len() >= 40 {
                     output::warning(&format!(
@@ -156,16 +159,16 @@ fn build_rpc_bind() -> Vec<u8> {
 
     // Abstract syntax: EPM interface UUID (e1af8308-5d1f-11c9-91a4-08002b14a0fa v3.0)
     pkt.extend_from_slice(&[
-        0x08, 0x83, 0xaf, 0xe1, 0x1f, 0x5d, 0xc9, 0x11, 0x91, 0xa4, 0x08, 0x00, 0x2b, 0x14,
-        0xa0, 0xfa,
+        0x08, 0x83, 0xaf, 0xe1, 0x1f, 0x5d, 0xc9, 0x11, 0x91, 0xa4, 0x08, 0x00, 0x2b, 0x14, 0xa0,
+        0xfa,
     ]);
     pkt.extend_from_slice(&3u16.to_le_bytes()); // Version major
     pkt.extend_from_slice(&0u16.to_le_bytes()); // Version minor
 
     // Transfer syntax: NDR (8a885d04-1ceb-11c9-9fe8-08002b104860 v2.0)
     pkt.extend_from_slice(&[
-        0x04, 0x5d, 0x88, 0x8a, 0xeb, 0x1c, 0xc9, 0x11, 0x9f, 0xe8, 0x08, 0x00, 0x2b, 0x10,
-        0x48, 0x60,
+        0x04, 0x5d, 0x88, 0x8a, 0xeb, 0x1c, 0xc9, 0x11, 0x9f, 0xe8, 0x08, 0x00, 0x2b, 0x10, 0x48,
+        0x60,
     ]);
     pkt.extend_from_slice(&2u16.to_le_bytes()); // Version major
     pkt.extend_from_slice(&0u16.to_le_bytes()); // Version minor
@@ -260,11 +263,13 @@ fn parse_epm_response(data: &[u8]) -> Option<Vec<RpcEndpoint>> {
         if pos + 12 > body.len() {
             break;
         }
-        let _max_count = u32::from_le_bytes([body[pos], body[pos + 1], body[pos + 2], body[pos + 3]]);
+        let _max_count =
+            u32::from_le_bytes([body[pos], body[pos + 1], body[pos + 2], body[pos + 3]]);
         pos += 4;
         let _offset = u32::from_le_bytes([body[pos], body[pos + 1], body[pos + 2], body[pos + 3]]);
         pos += 4;
-        let actual_count = u32::from_le_bytes([body[pos], body[pos + 1], body[pos + 2], body[pos + 3]]) as usize;
+        let actual_count =
+            u32::from_le_bytes([body[pos], body[pos + 1], body[pos + 2], body[pos + 3]]) as usize;
         pos += 4;
 
         if pos + actual_count > body.len() {
@@ -282,14 +287,16 @@ fn parse_epm_response(data: &[u8]) -> Option<Vec<RpcEndpoint>> {
         if pos + 4 > body.len() {
             break;
         }
-        let tower_len = u32::from_le_bytes([body[pos], body[pos + 1], body[pos + 2], body[pos + 3]]) as usize;
+        let tower_len =
+            u32::from_le_bytes([body[pos], body[pos + 1], body[pos + 2], body[pos + 3]]) as usize;
         pos += 4;
 
         // Actual tower_length repeated
         if pos + 4 > body.len() {
             break;
         }
-        let _actual_tower_len = u32::from_le_bytes([body[pos], body[pos + 1], body[pos + 2], body[pos + 3]]) as usize;
+        let _actual_tower_len =
+            u32::from_le_bytes([body[pos], body[pos + 1], body[pos + 2], body[pos + 3]]) as usize;
         pos += 4;
 
         if pos + tower_len > body.len() {

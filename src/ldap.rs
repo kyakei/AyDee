@@ -44,7 +44,10 @@ pub async fn run(target: &str, port: u16, selected_tags: &[String]) -> Result<Ld
     };
 
     output::section("LDAP ENUMERATION");
-    output::info(&format!("Attempting null bind on {}://{}:{}", scheme, target, port));
+    output::info(&format!(
+        "Attempting null bind on {}://{}:{}",
+        scheme, target, port
+    ));
 
     let url = format!("{}://{}:{}", scheme, target, port);
 
@@ -112,12 +115,7 @@ pub async fn run(target: &str, port: u16, selected_tags: &[String]) -> Result<Ld
     ];
 
     let search_result = ldap
-        .search(
-            "",
-            Scope::Base,
-            "(objectClass=*)",
-            root_dse_attrs,
-        )
+        .search("", Scope::Base, "(objectClass=*)", root_dse_attrs)
         .await;
 
     match search_result {
@@ -153,22 +151,34 @@ pub async fn run(target: &str, port: u16, selected_tags: &[String]) -> Result<Ld
 
                             match display_attr {
                                 "domainFunctionality" if show_rootdse => {
-                                    let level = values.first().map(|v| functional_level(v)).unwrap_or("unknown".to_string());
+                                    let level = values
+                                        .first()
+                                        .map(|v| functional_level(v))
+                                        .unwrap_or("unknown".to_string());
                                     output::kv("Domain Functional Level", &level);
                                 }
                                 "forestFunctionality" if show_rootdse => {
-                                    let level = values.first().map(|v| functional_level(v)).unwrap_or("unknown".to_string());
+                                    let level = values
+                                        .first()
+                                        .map(|v| functional_level(v))
+                                        .unwrap_or("unknown".to_string());
                                     output::kv("Forest Functional Level", &level);
                                 }
                                 "domainControllerFunctionality" if show_rootdse => {
-                                    let level = values.first().map(|v| functional_level(v)).unwrap_or("unknown".to_string());
+                                    let level = values
+                                        .first()
+                                        .map(|v| functional_level(v))
+                                        .unwrap_or("unknown".to_string());
                                     output::kv("DC Functional Level", &level);
                                 }
                                 "supportedSASLMechanisms" if show_rootdse => {
                                     output::kv("SASL Mechanisms", &values.join(", "));
                                 }
                                 "supportedControl" if show_rootdse => {
-                                    output::kv("Supported Controls", &format!("{} controls", values.len()));
+                                    output::kv(
+                                        "Supported Controls",
+                                        &format!("{} controls", values.len()),
+                                    );
                                 }
                                 "supportedLDAPVersion" if show_rootdse => {
                                     output::kv("LDAP Versions", &values.join(", "));

@@ -35,8 +35,7 @@ pub async fn run_authenticated(
 
     if kerberos {
         attempted = true;
-        let (ok, found) =
-            run_method(target, username, &[], &["-k", "--use-kcache"]).await;
+        let (ok, found) = run_method(target, username, &[], &["-k", "--use-kcache"]).await;
         found_tool |= found;
         any_success |= ok;
     }
@@ -125,9 +124,7 @@ fn looks_success(out: &str, username: &str) -> bool {
         return false;
     }
 
-    l.contains("pwn3d")
-        || l.contains("status_success")
-        || (l.contains("[+]") && l.contains(&u))
+    l.contains("pwn3d") || l.contains("status_success") || (l.contains("[+]") && l.contains(&u))
 }
 
 fn trim_for_display(s: &str, max: usize) -> String {

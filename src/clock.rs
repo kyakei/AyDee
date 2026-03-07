@@ -8,7 +8,7 @@ use tokio::time::timeout;
 
 use crate::output;
 
-pub async fn maybe_fix_clock_skew(target: &str, enabled: bool) {
+pub async fn maybe_fix_clock_skew(target: &str, enabled: bool, non_interactive: bool) {
     if !enabled {
         output::info("Clock skew auto-fix disabled");
         return;
@@ -46,10 +46,10 @@ pub async fn maybe_fix_clock_skew(target: &str, enabled: bool) {
         output::warning(
             "Clock sync attempt failed (permissions/tooling). Kerberos may fail with clock skew (Kerberoast/AS-REP/TGT may not work reliably).",
         );
-        maybe_prompt_privileged_retry(target).await;
+        maybe_prompt_privileged_retry(target, non_interactive).await;
     } else {
         output::warning("No supported time-sync tool found (`ntpdate` or `rdate`)");
-        maybe_prompt_privileged_retry(target).await;
+        maybe_prompt_privileged_retry(target, non_interactive).await;
     }
 }
 
@@ -87,8 +87,8 @@ fn trim_for_display(s: &str, max: usize) -> String {
     format!("{} <snip>", clipped)
 }
 
-async fn maybe_prompt_privileged_retry(target: &str) {
-    if !io::stdin().is_terminal() {
+async fn maybe_prompt_privileged_retry(target: &str, non_interactive: bool) {
+    if non_interactive || !io::stdin().is_terminal() {
         output::info("Non-interactive session detected; skipping sudo password prompt.");
         return;
     }
@@ -160,9 +160,7 @@ async fn run_sudo_with_password(
 
     let mut child = cmd.spawn().ok()?;
     if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin
-            .write_all(format!("{}\n", password).as_bytes())
-            .await;
+        let _ = stdin.write_all(format!("{}\n", password).as_bytes()).await;
     }
     let out = timeout(Duration::from_secs(10), child.wait_with_output())
         .await

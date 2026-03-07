@@ -1,9 +1,28 @@
 use anyhow::Result;
+use serde::Serialize;
+use std::fs::File;
 use std::io::ErrorKind;
+use std::path::Path;
 use tokio::process::Command;
 use tokio::time::{timeout, Duration};
+use zip::read::ZipArchive;
 
 use crate::output;
+
+#[derive(Debug, Clone, Serialize)]
+struct BloodHoundZipSummary {
+    path: String,
+    size_bytes: u64,
+    json_entries: usize,
+    entry_kinds: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct BloodHoundSummary {
+    output_dir: String,
+    zip_count: usize,
+    zips: Vec<BloodHoundZipSummary>,
+}
 
 /// Run BloodHound collection using available auth methods.
 pub async fn run_collection(
@@ -58,19 +77,22 @@ pub async fn run_collection(
 
     if !attempted {
         output::warning("No BloodHound auth method provided (--password, --ntlm, or --kerberos)");
-        return Ok(false);
+        Ok(false)
     } else if !installed {
-        output::warning("No BloodHound collector binary found (tried: bloodhound-python, bloodhound-ce-python)");
-        return Ok(false);
+        output::warning(
+            "No BloodHound collector binary found (tried: bloodhound-python, bloodhound-ce-python)",
+        );
+        Ok(false)
     } else if any_success {
+        summarize_output_dir(output_dir);
         output::success(&format!(
             "BloodHound collection completed. Zip output should be in ./{}/",
             output_dir
         ));
-        return Ok(true);
+        Ok(true)
     } else {
         output::warning("BloodHound methods were attempted, but no collection succeeded");
-        return Ok(false);
+        Ok(false)
     }
 }
 
@@ -253,7 +275,11 @@ async fn run_with_candidates(
 
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 let stdout = String::from_utf8_lossy(&out.stdout);
-                output::warning(&format!("{} method failed (exit {:?})", bin, out.status.code()));
+                output::warning(&format!(
+                    "{} method failed (exit {:?})",
+                    bin,
+                    out.status.code()
+                ));
                 if !stderr.trim().is_empty() {
                     output::kv("stderr", stderr.trim());
                 } else if !stdout.trim().is_empty() {
@@ -264,4 +290,100 @@ async fn run_with_candidates(
     }
 
     Ok((false, found_any))
+}
+
+fn summarize_output_dir(output_dir: &str) {
+    let path = Path::new(output_dir);
+    let Ok(entries) = std::fs::read_dir(path) else {
+        output::warning("BloodHound output directory could not be inspected");
+        return;
+    };
+
+    let mut summaries = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        if path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
+        {
+            summaries.push(inspect_zip(&path, meta.len()));
+        }
+    }
+
+    let summaries = summaries.into_iter().flatten().collect::<Vec<_>>();
+    if summaries.is_empty() {
+        output::warning("BloodHound reported success, but no zip artifact was found yet");
+        return;
+    }
+
+    output::success(&format!("BloodHound zip artifacts: {}", summaries.len()));
+    for summary in summaries.iter().take(5) {
+        output::kv(
+            "Zip",
+            &format!(
+                "{} ({} bytes, {} JSON entries)",
+                summary.path, summary.size_bytes, summary.json_entries
+            ),
+        );
+        if !summary.entry_kinds.is_empty() {
+            output::kv("Kinds", &summary.entry_kinds.join(", "));
+        }
+    }
+
+    let summary = BloodHoundSummary {
+        output_dir: output_dir.to_string(),
+        zip_count: summaries.len(),
+        zips: summaries,
+    };
+    let summary_path = Path::new(output_dir).join("collection_summary.json");
+    if let Ok(json) = serde_json::to_string_pretty(&summary) {
+        let _ = std::fs::write(summary_path, json);
+    }
+}
+
+fn inspect_zip(path: &Path, size_bytes: u64) -> Option<BloodHoundZipSummary> {
+    let file = File::open(path).ok()?;
+    let mut archive = ZipArchive::new(file).ok()?;
+    let mut json_entries = 0usize;
+    let mut entry_kinds = Vec::new();
+
+    for idx in 0..archive.len() {
+        let file = archive.by_index(idx).ok()?;
+        let name = file.name().to_string();
+        if name.ends_with(".json") {
+            json_entries += 1;
+            if let Some(kind) = classify_entry_kind(&name) {
+                entry_kinds.push(kind);
+            }
+        }
+    }
+
+    entry_kinds.sort();
+    entry_kinds.dedup();
+
+    Some(BloodHoundZipSummary {
+        path: path.display().to_string(),
+        size_bytes,
+        json_entries,
+        entry_kinds,
+    })
+}
+
+fn classify_entry_kind(name: &str) -> Option<String> {
+    let file = Path::new(name)
+        .file_name()?
+        .to_str()?
+        .trim_end_matches(".json");
+    let kind = file
+        .rsplit_once('_')
+        .map(|(_, suffix)| suffix)
+        .unwrap_or(file);
+    Some(kind.to_string())
 }

@@ -5,8 +5,8 @@ use serde::Serialize;
 use std::collections::HashSet;
 use std::env;
 use std::fs;
-use std::io::{self, IsTerminal, Write};
 use std::io::ErrorKind;
+use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::process::Command;
@@ -37,7 +37,12 @@ fn display_limited(items: &[String], limit: usize) -> String {
     if items.len() <= limit {
         return items.join(", ");
     }
-    let mut out = items.iter().take(limit).cloned().collect::<Vec<_>>().join(", ");
+    let mut out = items
+        .iter()
+        .take(limit)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
     out.push_str(", <snip>");
     out
 }
@@ -56,6 +61,7 @@ pub async fn run(
     password: &str,
     domain: &str,
     selected_tags: &[String],
+    non_interactive: bool,
 ) -> Result<AuthReconResult> {
     let mut result = AuthReconResult::default();
     let scheme = if port == 636 || port == 3269 {
@@ -188,13 +194,8 @@ pub async fn run(
         || auth_tag_selected(selected_tags, "groupmembership")
         || auth_tag_selected(selected_tags, "groups")
     {
-        collect_group_membership_whoami(
-            &mut ldap,
-            &base_dn,
-            &bind_principal,
-            &mut result.findings,
-        )
-        .await?;
+        collect_group_membership_whoami(&mut ldap, &base_dn, &bind_principal, &mut result.findings)
+            .await?;
     }
     if auth_tag_selected(selected_tags, "groups") {
         collect_groups_inventory(&mut ldap, &base_dn, &mut result.findings).await?;
@@ -224,13 +225,8 @@ pub async fn run(
         collect_gpo_inventory(&mut ldap, &base_dn, &mut result.findings).await?;
     }
     if auth_tag_selected(selected_tags, "priv-routes") {
-        collect_user_privilege_routes(
-            &mut ldap,
-            &base_dn,
-            &bind_principal,
-            &mut result.findings,
-        )
-        .await?;
+        collect_user_privilege_routes(&mut ldap, &base_dn, &bind_principal, &mut result.findings)
+            .await?;
     }
 
     if auth_tag_selected(selected_tags, "kerberoast") {
@@ -257,16 +253,13 @@ pub async fn run(
     if auth_tag_selected(selected_tags, "pre2k") {
         attempt_pre2k_tgt(target, domain, &pre2k_candidates, &mut result.findings).await;
     }
-    if auth_tag_selected(selected_tags, "adcs")
-        || auth_tag_selected(selected_tags, "certipy")
-    {
+    if auth_tag_selected(selected_tags, "adcs") || auth_tag_selected(selected_tags, "certipy") {
         attempt_certipy_find(target, domain, username, password, &mut result.findings).await;
     }
     if auth_tag_selected(selected_tags, "raisechild") {
         attempt_raisechild(target, domain, username, password, &mut result.findings).await;
     }
-    if auth_tag_selected(selected_tags, "kerberoast")
-        && spn_write_abuse_candidate(&result.findings)
+    if auth_tag_selected(selected_tags, "kerberoast") && spn_write_abuse_candidate(&result.findings)
     {
         maybe_prompt_fake_spn_roast(
             &mut ldap,
@@ -276,6 +269,7 @@ pub async fn run(
             password,
             &base_dn,
             &mut result.findings,
+            non_interactive,
         )
         .await?;
     }
@@ -308,11 +302,13 @@ fn normalize_sam(username: &str) -> String {
     username.to_string()
 }
 
-fn confirm_fake_spn_attempt() -> bool {
-    if !io::stdin().is_terminal() {
+fn confirm_fake_spn_attempt(non_interactive: bool) -> bool {
+    if non_interactive || !io::stdin().is_terminal() {
         return false;
     }
-    print!("  [*] Potential SPN write abuse path detected. Attempt fake SPN write + roast? [y/N]: ");
+    print!(
+        "  [*] Potential SPN write abuse path detected. Attempt fake SPN write + roast? [y/N]: "
+    );
     let _ = io::stdout().flush();
     let mut line = String::new();
     if io::stdin().read_line(&mut line).is_err() {
@@ -348,8 +344,9 @@ async fn maybe_prompt_fake_spn_roast(
     password: &str,
     base_dn: &str,
     findings: &mut Vec<AuthFinding>,
+    non_interactive: bool,
 ) -> Result<()> {
-    if !confirm_fake_spn_attempt() {
+    if !confirm_fake_spn_attempt(non_interactive) {
         output::info("Skipped fake SPN write abuse attempt");
         return Ok(());
     }
@@ -357,7 +354,12 @@ async fn maybe_prompt_fake_spn_roast(
     let sam = normalize_sam(username);
     let user_filter = format!("(&(objectClass=user)(sAMAccountName={}))", sam);
     let query = ldap
-        .search(base_dn, Scope::Subtree, &user_filter, vec!["distinguishedName"])
+        .search(
+            base_dn,
+            Scope::Subtree,
+            &user_filter,
+            vec!["distinguishedName"],
+        )
         .await?;
     let (entries, _) = query.success()?;
     if entries.is_empty() {
@@ -375,10 +377,7 @@ async fn maybe_prompt_fake_spn_roast(
     let mut add_vals: HashSet<&str> = HashSet::new();
     add_vals.insert(fake_spn.as_str());
     let add_res = ldap
-        .modify(
-            &user_dn,
-            vec![Mod::Add("servicePrincipalName", add_vals)],
-        )
+        .modify(&user_dn, vec![Mod::Add("servicePrincipalName", add_vals)])
         .await;
     match add_res {
         Ok(r) if r.rc == 0 => {
@@ -433,7 +432,10 @@ async fn maybe_prompt_fake_spn_roast(
     let mut del_vals: HashSet<&str> = HashSet::new();
     del_vals.insert(fake_spn.as_str());
     let del_res = ldap
-        .modify(&user_dn, vec![Mod::Delete("servicePrincipalName", del_vals)])
+        .modify(
+            &user_dn,
+            vec![Mod::Delete("servicePrincipalName", del_vals)],
+        )
         .await;
     match del_res {
         Ok(r) if r.rc == 0 => {
@@ -604,8 +606,9 @@ async fn collect_asrep_roastable(
             severity: "high".to_string(),
             title: "AS-REP roastable user accounts found".to_string(),
             evidence: format!("{} users: {}", users.len(), display_limited(&sample, 10)),
-            recommendation: "Enable Kerberos pre-authentication for these users and rotate credentials."
-                .to_string(),
+            recommendation:
+                "Enable Kerberos pre-authentication for these users and rotate credentials."
+                    .to_string(),
         });
     }
     Ok(users)
@@ -720,7 +723,9 @@ async fn collect_delegation_findings(
             severity: "medium".to_string(),
             title: "Constrained delegation principals found".to_string(),
             evidence: format!("{} objects with msDS-AllowedToDelegateTo", constrained),
-            recommendation: "Validate constrained delegation scope and remove stale delegation entries.".to_string(),
+            recommendation:
+                "Validate constrained delegation scope and remove stale delegation entries."
+                    .to_string(),
         });
     }
 
@@ -762,14 +767,22 @@ async fn collect_user_privilege_routes(
         let user = bind_principal.split('@').next().unwrap_or(bind_principal);
         format!("(&(objectClass=user)(sAMAccountName={}))", user)
     } else if bind_principal.contains('\\') {
-        let user = bind_principal.split('\\').next_back().unwrap_or(bind_principal);
+        let user = bind_principal
+            .split('\\')
+            .next_back()
+            .unwrap_or(bind_principal);
         format!("(&(objectClass=user)(sAMAccountName={}))", user)
     } else {
         format!("(&(objectClass=user)(sAMAccountName={}))", bind_principal)
     };
 
     let query = ldap
-        .search(base_dn, Scope::Subtree, &user_filter, vec!["memberOf", "distinguishedName"])
+        .search(
+            base_dn,
+            Scope::Subtree,
+            &user_filter,
+            vec!["memberOf", "distinguishedName"],
+        )
         .await?;
     let (entries, _) = query.success()?;
     if entries.is_empty() {
@@ -968,7 +981,13 @@ async fn collect_trust_findings(
             base_dn,
             Scope::Subtree,
             "(objectClass=trustedDomain)",
-            vec!["cn", "trustPartner", "trustDirection", "trustType", "trustAttributes"],
+            vec![
+                "cn",
+                "trustPartner",
+                "trustDirection",
+                "trustType",
+                "trustAttributes",
+            ],
         )
         .await?;
     let (entries, _) = query.success()?;
@@ -995,8 +1014,14 @@ async fn collect_trust_findings(
             id: "AUTH-TRUST-MAPPING".to_string(),
             severity: "info".to_string(),
             title: "Domain trust objects discovered".to_string(),
-            evidence: format!("{} trust objects. Sample: {}", entries.len(), sample.join(", ")),
-            recommendation: "Validate trust direction, SID filtering, and selective authentication settings.".to_string(),
+            evidence: format!(
+                "{} trust objects. Sample: {}",
+                entries.len(),
+                sample.join(", ")
+            ),
+            recommendation:
+                "Validate trust direction, SID filtering, and selective authentication settings."
+                    .to_string(),
         });
     }
     Ok(())
@@ -1018,7 +1043,12 @@ async fn collect_dcsync_heuristics(
     ] {
         let filter = format!("(&(objectClass=group)(cn={}))", group);
         let query = ldap
-            .search(base_dn, Scope::Subtree, &filter, vec!["member", "distinguishedName"])
+            .search(
+                base_dn,
+                Scope::Subtree,
+                &filter,
+                vec!["member", "distinguishedName"],
+            )
             .await?;
         let (entries, _) = query.success()?;
         for entry in entries {
@@ -1118,16 +1148,18 @@ async fn collect_adcs_template_heuristics(
             .and_then(|v| v.first())
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(0);
-        let ekus = e.attrs.get("pKIExtendedKeyUsage").cloned().unwrap_or_default();
+        let ekus = e
+            .attrs
+            .get("pKIExtendedKeyUsage")
+            .cloned()
+            .unwrap_or_default();
 
         let enrollee_supplies_subject = (enrollee_flag & 0x1) != 0;
         let requires_manager_approval = (enrollment_flag & 0x2) != 0;
         let has_auth_eku = ekus.iter().any(|oid| {
             matches!(
                 oid.as_str(),
-                "1.3.6.1.5.5.7.3.2"
-                    | "1.3.6.1.4.1.311.20.2.2"
-                    | "2.5.29.37.0"
+                "1.3.6.1.5.5.7.3.2" | "1.3.6.1.4.1.311.20.2.2" | "2.5.29.37.0"
             )
         });
 
@@ -1165,7 +1197,12 @@ async fn collect_machine_account_quota(
     findings: &mut Vec<AuthFinding>,
 ) -> Result<()> {
     let query = ldap
-        .search(base_dn, Scope::Base, "(objectClass=*)", vec!["ms-DS-MachineAccountQuota"])
+        .search(
+            base_dn,
+            Scope::Base,
+            "(objectClass=*)",
+            vec!["ms-DS-MachineAccountQuota"],
+        )
         .await?;
     let (entries, _) = query.success()?;
     for entry in entries {
@@ -1180,9 +1217,12 @@ async fn collect_machine_account_quota(
                     findings.push(AuthFinding {
                         id: "AUTH-MAQ".to_string(),
                         severity: "medium".to_string(),
-                        title: "MachineAccountQuota allows machine account creation by users".to_string(),
+                        title: "MachineAccountQuota allows machine account creation by users"
+                            .to_string(),
                         evidence: format!("ms-DS-MachineAccountQuota={}", n),
-                        recommendation: "Set MAQ to 0 unless explicitly required for join workflows.".to_string(),
+                        recommendation:
+                            "Set MAQ to 0 unless explicitly required for join workflows."
+                                .to_string(),
                     });
                 }
             }
@@ -1202,7 +1242,11 @@ async fn collect_pso(
             &pso_base,
             Scope::OneLevel,
             "(objectClass=msDS-PasswordSettings)",
-            vec!["name", "msDS-MinimumPasswordLength", "msDS-LockoutThreshold"],
+            vec![
+                "name",
+                "msDS-MinimumPasswordLength",
+                "msDS-LockoutThreshold",
+            ],
         )
         .await;
     let Ok(query) = query else {
@@ -1220,7 +1264,9 @@ async fn collect_pso(
         severity: "info".to_string(),
         title: "Fine-Grained Password Policy objects found".to_string(),
         evidence: format!("{} PSO objects discovered", entries.len()),
-        recommendation: "Review PSO scope and ensure privileged identities have strong dedicated policies.".to_string(),
+        recommendation:
+            "Review PSO scope and ensure privileged identities have strong dedicated policies."
+                .to_string(),
     });
     Ok(())
 }
@@ -1259,7 +1305,11 @@ async fn collect_computer_inventory(
             .cloned()
             .unwrap_or_else(|| "<unknown>".to_string());
         let los = os.to_ascii_lowercase();
-        if los.contains("2008") || los.contains("2003") || los.contains("xp") || los.contains("windows 7") {
+        if los.contains("2008")
+            || los.contains("2003")
+            || los.contains("xp")
+            || los.contains("windows 7")
+        {
             obsolete.push(format!("{} ({})", host, os));
         }
     }
@@ -1304,7 +1354,8 @@ async fn collect_subnets_sites(
         severity: "info".to_string(),
         title: "AD Sites/Subnets objects found".to_string(),
         evidence: format!("{} subnet objects discovered", entries.len()),
-        recommendation: "Review subnet/site mapping for segmentation and tiering alignment.".to_string(),
+        recommendation: "Review subnet/site mapping for segmentation and tiering alignment."
+            .to_string(),
     });
     Ok(())
 }
@@ -1335,7 +1386,8 @@ async fn collect_sccm_hints(
             severity: "medium".to_string(),
             title: "SCCM infrastructure objects detected".to_string(),
             evidence: format!("{} SCCM-related LDAP objects found", entries.len()),
-            recommendation: "Assess SCCM roles/permissions for lateral movement abuse paths.".to_string(),
+            recommendation: "Assess SCCM roles/permissions for lateral movement abuse paths."
+                .to_string(),
         });
     }
     Ok(())
@@ -1351,7 +1403,13 @@ async fn collect_user_attr_hints(
             base_dn,
             Scope::Subtree,
             "(&(objectCategory=person)(objectClass=user))",
-            vec!["sAMAccountName", "description", "info", "userPassword", "unixUserPassword"],
+            vec![
+                "sAMAccountName",
+                "description",
+                "info",
+                "userPassword",
+                "unixUserPassword",
+            ],
         )
         .await?;
     let (entries, _) = query.success()?;
@@ -1391,8 +1449,9 @@ async fn collect_user_attr_hints(
             severity: "high".to_string(),
             title: "Potential credential hints found in user descriptions".to_string(),
             evidence: display_limited(&desc_hits, 10),
-            recommendation: "Remove secrets from LDAP description fields and rotate exposed credentials."
-                .to_string(),
+            recommendation:
+                "Remove secrets from LDAP description fields and rotate exposed credentials."
+                    .to_string(),
         });
     }
     if !info_hits.is_empty() {
@@ -1410,8 +1469,13 @@ async fn collect_user_attr_hints(
             id: "AUTH-USER-PASSWORD-ATTR".to_string(),
             severity: "critical".to_string(),
             title: "Readable password-related LDAP attributes found".to_string(),
-            evidence: format!("{} user objects exposed userPassword/unixUserPassword", pwd_attr),
-            recommendation: "Immediately remove exposed password attributes and audit directory ACLs.".to_string(),
+            evidence: format!(
+                "{} user objects exposed userPassword/unixUserPassword",
+                pwd_attr
+            ),
+            recommendation:
+                "Immediately remove exposed password attributes and audit directory ACLs."
+                    .to_string(),
         });
     }
     Ok(())
@@ -1480,7 +1544,12 @@ async fn collect_deleted_recoverable_accounts(
             .get("sAMAccountName")
             .and_then(|v| v.first())
             .cloned()
-            .or_else(|| e.attrs.get("msDS-LastKnownRDN").and_then(|v| v.first()).cloned())
+            .or_else(|| {
+                e.attrs
+                    .get("msDS-LastKnownRDN")
+                    .and_then(|v| v.first())
+                    .cloned()
+            })
             .unwrap_or_else(|| "<unknown>".to_string());
         let parent = e
             .attrs
@@ -1494,19 +1563,21 @@ async fn collect_deleted_recoverable_accounts(
             .and_then(|v| v.first())
             .cloned()
             .unwrap_or_else(|| "<unknown>".to_string());
-        let desc = e
-            .attrs
-            .get("description")
-            .and_then(|v| v.first())
-            .cloned();
+        let desc = e.attrs.get("description").and_then(|v| v.first()).cloned();
 
         if !recycled {
             recoverable.push(account.clone());
             if sample.len() < 12 {
                 if let Some(d) = desc {
-                    sample.push(format!("{} | parent={} | whenChanged={} | desc={}", account, parent, changed, d));
+                    sample.push(format!(
+                        "{} | parent={} | whenChanged={} | desc={}",
+                        account, parent, changed, d
+                    ));
                 } else {
-                    sample.push(format!("{} | parent={} | whenChanged={}", account, parent, changed));
+                    sample.push(format!(
+                        "{} | parent={} | whenChanged={}",
+                        account, parent, changed
+                    ));
                 }
             }
         }
@@ -1521,7 +1592,10 @@ async fn collect_deleted_recoverable_accounts(
             recoverable.len()
         ));
         if !recoverable.is_empty() {
-            output::kv("Recoverable Deleted Users", &display_limited(&recoverable, 10));
+            output::kv(
+                "Recoverable Deleted Users",
+                &display_limited(&recoverable, 10),
+            );
         }
         findings.push(AuthFinding {
             id: "AUTH-DELETED-ACCOUNTS".to_string(),
@@ -1579,7 +1653,8 @@ async fn collect_laps_readability(
             severity: "critical".to_string(),
             title: "LAPS passwords appear readable by current principal".to_string(),
             evidence: display_limited(&laps_hosts, 10),
-            recommendation: "Restrict LAPS password read ACLs to dedicated tier-0 groups only.".to_string(),
+            recommendation: "Restrict LAPS password read ACLs to dedicated tier-0 groups only."
+                .to_string(),
         });
     }
     Ok(())
@@ -1591,7 +1666,10 @@ async fn collect_adcs_enrollment_services(
     findings: &mut Vec<AuthFinding>,
 ) -> Result<()> {
     let conf = format!("CN=Configuration,{}", base_dn);
-    let es_base = format!("CN=Enrollment Services,CN=Public Key Services,CN=Services,{}", conf);
+    let es_base = format!(
+        "CN=Enrollment Services,CN=Public Key Services,CN=Services,{}",
+        conf
+    );
     let query = ldap
         .search(
             &es_base,
@@ -1629,7 +1707,9 @@ async fn collect_adcs_enrollment_services(
             severity: "info".to_string(),
             title: "AD CS enrollment services discovered in LDAP".to_string(),
             evidence: display_limited(&cas, 10),
-            recommendation: "Assess CA/template permissions and EPA/HTTPS posture for AD CS hardening.".to_string(),
+            recommendation:
+                "Assess CA/template permissions and EPA/HTTPS posture for AD CS hardening."
+                    .to_string(),
         });
     }
     Ok(())
@@ -1733,7 +1813,9 @@ async fn collect_gpo_inventory(
             total,
             display_limited(&sample, 10)
         ),
-        recommendation: "Review GPO ownership/link targets and writable policy paths for abuse opportunities.".to_string(),
+        recommendation:
+            "Review GPO ownership/link targets and writable policy paths for abuse opportunities."
+                .to_string(),
     });
     Ok(())
 }
@@ -1836,7 +1918,12 @@ async fn collect_group_membership_whoami(
                 "(&(objectCategory=person)(objectClass=user)(sAMAccountName={}))",
                 sam
             ),
-            vec!["distinguishedName", "memberOf", "description", "sAMAccountName"],
+            vec![
+                "distinguishedName",
+                "memberOf",
+                "description",
+                "sAMAccountName",
+            ],
         )
         .await?;
     let (entries, _) = query.success()?;
@@ -1934,7 +2021,9 @@ async fn collect_dns_nonsecure_updates(
             severity: "high".to_string(),
             title: "DNS zones allowing nonsecure dynamic updates detected".to_string(),
             evidence: display_limited(&risky, 10),
-            recommendation: "Require secure-only dynamic updates and restrict zone update permissions.".to_string(),
+            recommendation:
+                "Require secure-only dynamic updates and restrict zone update permissions."
+                    .to_string(),
         });
     }
     Ok(())
@@ -1988,7 +2077,9 @@ async fn collect_network_dns_inventory(
                 dns_nodes,
                 display_limited(&sample, 10)
             ),
-            recommendation: "Review DNS data exposure and stale records that can aid lateral movement.".to_string(),
+            recommendation:
+                "Review DNS data exposure and stale records that can aid lateral movement."
+                    .to_string(),
         });
     }
     Ok(())
@@ -2031,7 +2122,8 @@ async fn collect_dacl_readability(
             severity: "medium".to_string(),
             title: "Domain security descriptor appears readable".to_string(),
             evidence: "nTSecurityDescriptor returned for the domain object".to_string(),
-            recommendation: "Perform targeted ACL analysis for delegated rights abuse paths.".to_string(),
+            recommendation: "Perform targeted ACL analysis for delegated rights abuse paths."
+                .to_string(),
         });
     }
     Ok(())
@@ -2075,8 +2167,14 @@ async fn collect_badsuccessor_heuristics(
         id: "AUTH-BADSUCCESSOR-HEURISTIC".to_string(),
         severity: "medium".to_string(),
         title: "DMSA/gMSA objects found (badsuccessor review candidate)".to_string(),
-        evidence: format!("{} candidate objects. Sample: {}", total, display_limited(&sample, 10)),
-        recommendation: "Review DMSA/gMSA delegation/ownership for badsuccessor-style abuse preconditions.".to_string(),
+        evidence: format!(
+            "{} candidate objects. Sample: {}",
+            total,
+            display_limited(&sample, 10)
+        ),
+        recommendation:
+            "Review DMSA/gMSA delegation/ownership for badsuccessor-style abuse preconditions."
+                .to_string(),
     });
     Ok(())
 }
@@ -2128,7 +2226,8 @@ async fn attempt_certipy_find(
                     severity: "high".to_string(),
                     title: "certipy find executed successfully".to_string(),
                     evidence: format!("tool={} | {}", bin, preview),
-                    recommendation: "Review vulnerable templates/ESC paths identified by certipy.".to_string(),
+                    recommendation: "Review vulnerable templates/ESC paths identified by certipy."
+                        .to_string(),
                 });
                 return;
             }

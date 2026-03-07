@@ -13,9 +13,10 @@ pub async fn run(
     domain: Option<&str>,
     wordlist: Option<&str>,
     collected_users: &[String],
+    non_interactive: bool,
 ) -> Result<()> {
     output::section("KERBEROS ENUMERATION");
-    if !prompt_yes_no_default_no("Run Kerberos username enumeration") {
+    if !non_interactive && !prompt_yes_no_default_no("Run Kerberos username enumeration") {
         output::info("Kerberos enumeration skipped");
         return Ok(());
     }
@@ -34,7 +35,10 @@ pub async fn run(
 
     // Add collected users first (from LDAP/SMB/RPC)
     if !collected_users.is_empty() {
-        output::info(&format!("Using {} usernames collected from other modules", collected_users.len()));
+        output::info(&format!(
+            "Using {} usernames collected from other modules",
+            collected_users.len()
+        ));
         usernames.extend(collected_users.iter().cloned());
 
         // Pre2k-ish machine-account variants: if we have HOST$, try HOST too.
@@ -98,13 +102,33 @@ pub async fn run(
     } else if collected_users.is_empty() {
         // Only add built-in if no collected users AND no wordlist
         let builtin: Vec<String> = vec![
-            "administrator", "admin", "guest", "krbtgt",
-            "backup", "service", "test", "user",
-            "svc_admin", "svc_backup", "svc_sql", "svc_web",
-            "sql_svc", "web_svc", "exchange", "mail",
-            "helpdesk", "support", "operator", "manager",
-            "domain_admin", "enterprise_admin", "it_admin",
-            "sa", "dba", "developer", "deploy",
+            "administrator",
+            "admin",
+            "guest",
+            "krbtgt",
+            "backup",
+            "service",
+            "test",
+            "user",
+            "svc_admin",
+            "svc_backup",
+            "svc_sql",
+            "svc_web",
+            "sql_svc",
+            "web_svc",
+            "exchange",
+            "mail",
+            "helpdesk",
+            "support",
+            "operator",
+            "manager",
+            "domain_admin",
+            "enterprise_admin",
+            "it_admin",
+            "sa",
+            "dba",
+            "developer",
+            "deploy",
         ]
         .into_iter()
         .map(String::from)
@@ -116,14 +140,21 @@ pub async fn run(
     usernames.sort_by_key(|a| a.to_lowercase());
     usernames.dedup_by(|a, b| a.to_lowercase() == b.to_lowercase());
 
-    if usernames.len() > 100_000
-        && !prompt_yes_no_default_no(&format!(
+    if usernames.len() > 100_000 {
+        if non_interactive {
+            output::warning(&format!(
+                "Large username set detected ({}). Skipping Kerberos enumeration in non-interactive mode",
+                usernames.len()
+            ));
+            return Ok(());
+        }
+        if !prompt_yes_no_default_no(&format!(
             "Large username set detected ({}). Continue Kerberos enumeration",
             usernames.len()
-        ))
-    {
-        output::info("Kerberos enumeration aborted by user");
-        return Ok(());
+        )) {
+            output::info("Kerberos enumeration aborted by user");
+            return Ok(());
+        }
     }
 
     output::info(&format!(
@@ -167,7 +198,11 @@ pub async fn run(
 
         checked += 1;
         if checked % 100 == 0 {
-            output::info(&format!("Progress: {}/{} checked", checked, usernames.len()));
+            output::info(&format!(
+                "Progress: {}/{} checked",
+                checked,
+                usernames.len()
+            ));
         }
     }
 
@@ -182,10 +217,7 @@ pub async fn run(
         output::success(&format!("Valid users: {}", valid_users.join(", ")));
     }
     if !asrep_users.is_empty() {
-        output::success(&format!(
-            "AS-REP Roastable: {}",
-            asrep_users.join(", ")
-        ));
+        output::success(&format!("AS-REP Roastable: {}", asrep_users.join(", ")));
     }
 
     Ok(())
@@ -205,11 +237,11 @@ fn prompt_yes_no_default_no(prompt: &str) -> bool {
 
 /// Result of checking a single user
 enum KerbResult {
-    Valid,         // KDC_ERR_PREAUTH_REQUIRED — user exists, needs preauth
+    Valid,          // KDC_ERR_PREAUTH_REQUIRED — user exists, needs preauth
     AsRepRoastable, // Got AS-REP — user exists, no preauth required
-    NotFound,      // KDC_ERR_C_PRINCIPAL_UNKNOWN
-    Locked,        // KDC_ERR_CLIENT_REVOKED
-    Disabled,      // KDC_ERR_CLIENT_REVOKED with disabled flag
+    NotFound,       // KDC_ERR_C_PRINCIPAL_UNKNOWN
+    Locked,         // KDC_ERR_CLIENT_REVOKED
+    Disabled,       // KDC_ERR_CLIENT_REVOKED with disabled flag
 }
 
 /// Build an AS-REQ for a given principal without pre-authentication
@@ -267,7 +299,7 @@ fn build_as_req(realm: &str, username: &str) -> Vec<u8> {
     // KDC-REQ (AS-REQ)
     let pvno = der_context_tag(1, &der_integer(5)); // Kerberos v5
     let msg_type = der_context_tag(2, &der_integer(10)); // AS-REQ = 10
-    // No padata — this is the key: no pre-auth data
+                                                         // No padata — this is the key: no pre-auth data
 
     let as_req_body = [pvno, msg_type, req_body_field].concat();
     let as_req = der_sequence(&as_req_body);

@@ -175,7 +175,9 @@ fn parse_users_from_text(text: &str, kind: &str, limit: usize) -> Option<String>
     let mut users = Vec::new();
     for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
         let parsed = match kind {
-            "kerberoast" => parse_kerberoast_user(line).or_else(|| parse_kerberoast_user_fallback(line)),
+            "kerberoast" => {
+                parse_kerberoast_user(line).or_else(|| parse_kerberoast_user_fallback(line))
+            }
             "asrep" => parse_asrep_user(line),
             _ => None,
         };
@@ -220,7 +222,10 @@ fn find_and_save_ccache(username: &str) -> Option<String> {
         format!("{}.ccache", username.trim_end_matches('$')),
         format!("{}$.ccache", username.trim_end_matches('$')),
         format!("{}.ccache", username.to_ascii_lowercase()),
-        format!("{}$.ccache", username.trim_end_matches('$').to_ascii_lowercase()),
+        format!(
+            "{}$.ccache",
+            username.trim_end_matches('$').to_ascii_lowercase()
+        ),
     ];
     candidates.sort();
     candidates.dedup();
@@ -283,7 +288,9 @@ async fn attempt_getuserspns_password(
                 "Requester: {}/{} | Users: {} | Output: {} | {}",
                 domain, username, attacked, output_file, preview
             ),
-            recommendation: "Rotate impacted service account credentials and enforce strong secrets.".to_string(),
+            recommendation:
+                "Rotate impacted service account credentials and enforce strong secrets."
+                    .to_string(),
         });
     }
 }
@@ -342,7 +349,8 @@ async fn attempt_getuserspns_ntlm(
                 "Requester: {}/{} | Users: {} | Output: {} | {}",
                 domain, username, attacked, output_file, preview
             ),
-            recommendation: "Rotate impacted service account credentials and review NTLM usage.".to_string(),
+            recommendation: "Rotate impacted service account credentials and review NTLM usage."
+                .to_string(),
         });
     }
 }
@@ -395,7 +403,9 @@ async fn attempt_getuserspns_kerberos(
                 "Requester: {}/{} | Users: {} | Output: {} | {}",
                 domain, username, attacked, output_file, preview
             ),
-            recommendation: "Rotate impacted service account credentials and review delegation/ticket controls.".to_string(),
+            recommendation:
+                "Rotate impacted service account credentials and review delegation/ticket controls."
+                    .to_string(),
         });
     }
 }
@@ -471,7 +481,10 @@ async fn attempt_getnpusers_noauth(
         let attacked = read_hash_users(output_file, "asrep", 10)
             .or_else(|| parse_users_from_text(&out_text, "asrep", 10));
         if preview.is_none() {
-            output::info(&format!("{} completed: no AS-REP roastable users returned", bin));
+            output::info(&format!(
+                "{} completed: no AS-REP roastable users returned",
+                bin
+            ));
             return;
         }
         let preview = preview.unwrap_or_else(|| "<hash file empty>".to_string());
@@ -486,9 +499,13 @@ async fn attempt_getnpusers_noauth(
             title: "AS-REP hashes captured from discovered users".to_string(),
             evidence: format!(
                 "Targets: {} (input users: {}) | Output: {} | {}",
-                attacked, filtered.len(), output_file, preview
+                attacked,
+                filtered.len(),
+                output_file,
+                preview
             ),
-            recommendation: "Enforce Kerberos pre-auth for impacted users and rotate credentials.".to_string(),
+            recommendation: "Enforce Kerberos pre-auth for impacted users and rotate credentials."
+                .to_string(),
         });
     }
 }
@@ -517,7 +534,13 @@ async fn attempt_getnpusers_authenticated(
     ])
     .await
     {
-        handle_asrep_result(&bin, &out_text, output_file, "all users via LDAP query", findings);
+        handle_asrep_result(
+            &bin,
+            &out_text,
+            output_file,
+            "all users via LDAP query",
+            findings,
+        );
     }
 }
 
@@ -552,7 +575,13 @@ async fn attempt_getnpusers_authenticated_ntlm(
     ])
     .await
     {
-        handle_asrep_result(&bin, &out_text, output_file, "all users via LDAP query", findings);
+        handle_asrep_result(
+            &bin,
+            &out_text,
+            output_file,
+            "all users via LDAP query",
+            findings,
+        );
     }
 }
 
@@ -581,7 +610,13 @@ async fn attempt_getnpusers_authenticated_kerberos(
     ])
     .await
     {
-        handle_asrep_result(&bin, &out_text, output_file, "all users via LDAP query", findings);
+        handle_asrep_result(
+            &bin,
+            &out_text,
+            output_file,
+            "all users via LDAP query",
+            findings,
+        );
     }
 }
 
@@ -592,15 +627,20 @@ fn handle_asrep_result(
     target_desc: &str,
     findings: &mut Vec<AuthFinding>,
 ) {
-    let preview = read_hash_preview(output_file, 10).or_else(|| hash_lines_from_text(out_text, "$krb5asrep$", 10));
-    let attacked =
-        read_hash_users(output_file, "asrep", 10).or_else(|| parse_users_from_text(out_text, "asrep", 10));
+    let preview = read_hash_preview(output_file, 10)
+        .or_else(|| hash_lines_from_text(out_text, "$krb5asrep$", 10));
+    let attacked = read_hash_users(output_file, "asrep", 10)
+        .or_else(|| parse_users_from_text(out_text, "asrep", 10));
     if preview.is_none() {
-        output::info(&format!("{} completed: no AS-REP roastable users returned", bin));
+        output::info(&format!(
+            "{} completed: no AS-REP roastable users returned",
+            bin
+        ));
         return;
     }
     let preview = preview.unwrap_or_else(|| "<hash file empty>".to_string());
-    let attacked = attacked.unwrap_or_else(|| "<could not parse usernames from output>".to_string());
+    let attacked =
+        attacked.unwrap_or_else(|| "<could not parse usernames from output>".to_string());
     output::kv("AS-REP Usernames", &attacked);
     output::kv("AS-REP Hashes", &preview);
     output::success(&format!("{} captured AS-REP roast data", bin));
@@ -612,7 +652,8 @@ fn handle_asrep_result(
             "Targets: {} ({}) | Output: {} | {}",
             attacked, target_desc, output_file, preview
         ),
-        recommendation: "Enforce Kerberos pre-auth for impacted users and rotate credentials.".to_string(),
+        recommendation: "Enforce Kerberos pre-auth for impacted users and rotate credentials."
+            .to_string(),
     });
 }
 
@@ -676,7 +717,10 @@ async fn attempt_pre2k_gettgt(
             let user_label = format!("{}$", machine);
             let ccache_saved = find_and_save_ccache(&user_label)
                 .unwrap_or_else(|| format!("{}.ccache", user_label));
-            success.push(format!("{} / {} / ticket={}", user_label, guess, ccache_saved));
+            success.push(format!(
+                "{} / {} / ticket={}",
+                user_label, guess, ccache_saved
+            ));
             output::kv("TGT Saved", &ccache_saved);
         }
     }
