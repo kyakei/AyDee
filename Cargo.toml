@@ -20,3 +20,8 @@ base64 = "0.22"
 aes = "0.8"
 cbc = "0.1"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
