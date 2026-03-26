@@ -4,66 +4,94 @@ use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
-use crate::output;
+use crate::types::{service_name, PortResult, StageTimer};
+use crate::ui;
 
-/// Default AD-related ports to scan
+/// Default AD-related ports
 const DEFAULT_PORTS: &[u16] = &[
-    80,   // HTTP (AD CS web enrollment / NTLM over HTTP)
-    53,   // DNS
-    88,   // Kerberos
-    443,  // HTTPS (AD CS web enrollment)
-    135,  // MSRPC
-    139,  // NetBIOS
-    389,  // LDAP
-    445,  // SMB
-    464,  // Kerberos kpasswd
-    593,  // HTTP RPC
-    636,  // LDAPS
-    3268, // Global Catalog
-    3269, // Global Catalog SSL
-    5985, // WinRM HTTP
-    5986, // WinRM HTTPS
-    8080, // Alternate HTTP
-    8443, // Alternate HTTPS
-    9389, // AD Web Services
+    53, 80, 88, 135, 139, 389, 443, 445, 464, 593, 636, 3268, 3269, 5985, 5986, 8080, 8443, 9389,
 ];
 
-/// Well-known AD service names by port
-pub fn service_name(port: u16) -> &'static str {
-    match port {
-        80 => "HTTP",
-        53 => "DNS",
-        88 => "Kerberos",
-        443 => "HTTPS",
-        135 => "MSRPC",
-        139 => "NetBIOS-SSN",
-        389 => "LDAP",
-        445 => "SMB",
-        464 => "Kpasswd",
-        593 => "HTTP-RPC",
-        636 => "LDAPS",
-        3268 => "Global Catalog",
-        3269 => "Global Catalog SSL",
-        5985 => "WinRM HTTP",
-        5986 => "WinRM HTTPS",
-        8080 => "HTTP-alt",
-        8443 => "HTTPS-alt",
-        9389 => "AD Web Services",
-        _ => "unknown",
+const MAX_CONCURRENT: usize = 256;
+
+/// Run a port scan against the target.
+pub async fn run(
+    target: &str,
+    port_spec: Option<&str>,
+    timeout_secs: u64,
+) -> Result<Vec<PortResult>> {
+    ui::section("PORT SCAN");
+
+    let ports = match port_spec {
+        Some(spec) => parse_ports(spec)?,
+        None => DEFAULT_PORTS.to_vec(),
+    };
+
+    let timer = StageTimer::start();
+    let pb = ui::progress_bar(ports.len() as u64, "SCAN");
+
+    let sem = std::sync::Arc::new(Semaphore::new(MAX_CONCURRENT));
+    let mut handles = Vec::new();
+
+    for port in &ports {
+        let target = target.to_string();
+        let port = *port;
+        let sem = sem.clone();
+        let pb = pb.clone();
+
+        handles.push(tokio::spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+            let open = scan_port(&target, port, timeout_secs).await;
+            pb.inc(1);
+            if open {
+                pb.set_message(format!("{}/{} open", port, service_name(port)));
+            }
+            PortResult {
+                port,
+                open,
+                service: service_name(port).to_string(),
+                banner: None,
+            }
+        }));
     }
+
+    let mut results = Vec::new();
+    for handle in handles {
+        if let Ok(r) = handle.await {
+            results.push(r);
+        }
+    }
+
+    results.sort_by_key(|r| r.port);
+    let open_count = results.iter().filter(|r| r.open).count();
+
+    pb.finish_and_clear();
+
+    // Display results
+    ui::port_table(&results);
+    println!();
+    ui::stage_done(
+        "PORT SCAN",
+        &format!("{}/{} ports open", open_count, ports.len()),
+        &timer.elapsed_pretty(),
+    );
+
+    // Show entry points
+    let open_ports: Vec<u16> = results.iter().filter(|r| r.open).map(|r| r.port).collect();
+    ui::entry_points(&open_ports);
+
+    Ok(results)
 }
 
-/// Result of scanning a single port
-#[derive(Debug, Clone)]
-pub struct PortResult {
-    pub port: u16,
-    pub open: bool,
-    pub service: String,
+async fn scan_port(target: &str, port: u16, timeout_secs: u64) -> bool {
+    let addr = format!("{}:{}", target, port);
+    timeout(Duration::from_secs(timeout_secs), TcpStream::connect(&addr))
+        .await
+        .map(|r| r.is_ok())
+        .unwrap_or(false)
 }
 
-/// Parse a port specification string
-/// Supports: "80", "80,443", "80-100", "80,443,8000-8100", "-" (all ports)
-pub fn parse_ports(spec: &str) -> Result<Vec<u16>> {
+fn parse_ports(spec: &str) -> Result<Vec<u16>> {
     let spec = spec.trim();
     if spec == "-" {
         return Ok((1..=65535).collect());
@@ -75,23 +103,19 @@ pub fn parse_ports(spec: &str) -> Result<Vec<u16>> {
         if part.is_empty() {
             continue;
         }
-        if part.contains('-') {
-            let range: Vec<&str> = part.split('-').collect();
-            if range.len() != 2 {
-                anyhow::bail!("Invalid port range: {}", part);
-            }
-            let start: u16 = range[0]
+        if let Some((start, end)) = part.split_once('-') {
+            let s: u16 = start
                 .trim()
                 .parse()
                 .map_err(|_| anyhow::anyhow!("Invalid start port in range: {}", part))?;
-            let end: u16 = range[1]
+            let e: u16 = end
                 .trim()
                 .parse()
                 .map_err(|_| anyhow::anyhow!("Invalid end port in range: {}", part))?;
-            if start > end {
+            if s > e {
                 anyhow::bail!("Invalid port range (start > end): {}", part);
             }
-            ports.extend(start..=end);
+            ports.extend(s..=e);
         } else {
             let port: u16 = part
                 .parse()
@@ -104,83 +128,9 @@ pub fn parse_ports(spec: &str) -> Result<Vec<u16>> {
         anyhow::bail!("No valid ports provided in --ports specification");
     }
 
+    ports.sort();
+    ports.dedup();
     Ok(ports)
-}
-
-/// Scan a single port via TCP connect
-async fn scan_port(ip: &str, port: u16, timeout_secs: u64) -> PortResult {
-    let is_open = timeout(
-        Duration::from_secs(timeout_secs),
-        TcpStream::connect((ip, port)),
-    )
-    .await
-    .map(|r| r.is_ok())
-    .unwrap_or(false);
-
-    PortResult {
-        port,
-        open: is_open,
-        service: service_name(port).to_string(),
-    }
-}
-
-/// Run a port scan against the target
-pub async fn run(
-    ip: &str,
-    custom_ports: Option<&str>,
-    timeout_secs: u64,
-) -> Result<Vec<PortResult>> {
-    let ports = match custom_ports {
-        Some(spec) => parse_ports(spec)?,
-        None => DEFAULT_PORTS.to_vec(),
-    };
-
-    output::section("PORT SCAN");
-    output::info(&format!("Scanning {} ports on {}", ports.len(), ip));
-
-    let semaphore = std::sync::Arc::new(Semaphore::new(200)); // max 200 concurrent connections
-    let mut handles = Vec::new();
-
-    for port in &ports {
-        let sem = semaphore.clone();
-        let ip = ip.to_string();
-        let port = *port;
-        let handle = tokio::spawn(async move {
-            let _permit = sem.acquire().await.unwrap();
-            scan_port(&ip, port, timeout_secs).await
-        });
-        handles.push(handle);
-    }
-
-    let mut results = Vec::new();
-    for handle in handles {
-        results.push(handle.await?);
-    }
-
-    // Sort by port number
-    results.sort_by_key(|r| r.port);
-
-    // Print results
-    let mut open_count = 0;
-    let mut closed_count = 0;
-
-    println!();
-    for result in &results {
-        if result.open {
-            output::port_open(result.port, &result.service);
-            open_count += 1;
-        } else {
-            // Only show closed ports when scanning small port sets
-            if ports.len() <= 20 {
-                output::port_closed(result.port, &result.service);
-            }
-            closed_count += 1;
-        }
-    }
-
-    output::summary(open_count, closed_count);
-
-    Ok(results)
 }
 
 #[cfg(test)]

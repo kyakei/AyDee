@@ -1,4 +1,7 @@
 /target
 /results
-
-AD_FEATURES_PROPOSAL.md
+/backup
+*.swp
+*.swo
+*~
+.env

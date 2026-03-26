@@ -1,136 +1,109 @@
 use anyhow::Result;
-use std::io::ErrorKind;
+use std::time::Duration;
 use tokio::process::Command;
-use tokio::time::{timeout, Duration};
+use tokio::time::timeout;
 
-use crate::output;
+use crate::types::{Finding, ModuleResult, Severity, StageTimer};
+use crate::ui;
 
-pub async fn run_authenticated(
+/// Run WinRM credential validation.
+pub async fn run(
     target: &str,
+    domain: &str,
     username: &str,
-    password: Option<&str>,
-    ntlm_hash: Option<&str>,
-    kerberos: bool,
-) -> Result<bool> {
-    output::section("WINRM AUTHENTICATED RECON");
-    output::info("Attempting WinRM credential validation");
+    password: &str,
+    ntlm: Option<&str>,
+) -> Result<ModuleResult> {
+    ui::section("WINRM VALIDATION");
+    let timer = StageTimer::start();
+    let spin = ui::spinner("WINRM");
+    let mut result = ModuleResult::new("winrm");
 
-    let mut attempted = false;
-    let mut any_success = false;
-    let mut found_tool = false;
+    spin.set_message("validating credentials...");
 
-    if let Some(pass) = password {
-        attempted = true;
-        let (ok, found) = run_method(target, username, &[("-p", pass)], &[]).await;
-        found_tool |= found;
-        any_success |= ok;
-    }
+    let tools = ["nxc", "netexec", "crackmapexec"];
+    let mut tested = false;
 
-    if let Some(hash) = ntlm_hash {
-        attempted = true;
-        let (ok, found) = run_method(target, username, &[("-H", hash)], &[]).await;
-        found_tool |= found;
-        any_success |= ok;
-    }
+    for tool in tools {
+        let mut args = vec![
+            "winrm".to_string(),
+            target.to_string(),
+            "-d".to_string(),
+            domain.to_string(),
+            "-u".to_string(),
+            username.to_string(),
+        ];
 
-    if kerberos {
-        attempted = true;
-        let (ok, found) = run_method(target, username, &[], &["-k", "--use-kcache"]).await;
-        found_tool |= found;
-        any_success |= ok;
-    }
-
-    if !attempted {
-        output::warning("No WinRM auth method provided (--password, --ntlm, or -k/--kerberos)");
-    } else if !found_tool {
-        output::warning("No WinRM tooling found (tried: nxc, netexec, crackmapexec)");
-    } else if any_success {
-        output::success("WinRM credential validation succeeded");
-    } else {
-        output::warning("WinRM auth methods were attempted, but none succeeded");
-    }
-
-    Ok(any_success)
-}
-
-async fn run_method(
-    target: &str,
-    username: &str,
-    kv_args: &[(&str, &str)],
-    flag_args: &[&str],
-) -> (bool, bool) {
-    let bins = ["nxc", "netexec", "crackmapexec"];
-    let mut found_any = false;
-
-    for bin in bins {
-        let mut cmd = Command::new(bin);
-        cmd.arg("winrm").arg(target).arg("-u").arg(username);
-        for (k, v) in kv_args {
-            cmd.arg(k).arg(v);
-        }
-        for f in flag_args {
-            cmd.arg(f);
+        if let Some(hash) = ntlm {
+            args.push("-H".to_string());
+            args.push(hash.to_string());
+        } else {
+            args.push("-p".to_string());
+            args.push(password.to_string());
         }
 
-        let out = match timeout(Duration::from_secs(45), cmd.output()).await {
+        let out = timeout(
+            Duration::from_secs(30),
+            Command::new(tool).args(&args).output(),
+        )
+        .await;
+
+        match out {
+            Ok(Ok(output)) => {
+                tested = true;
+                let raw_stdout = String::from_utf8_lossy(&output.stdout);
+                let raw_stderr = String::from_utf8_lossy(&output.stderr);
+                ui::verbose_output(tool, &raw_stdout);
+                ui::verbose_output(tool, &raw_stderr);
+                let stdout = raw_stdout.to_lowercase();
+                let stderr = raw_stderr.to_lowercase();
+                let combined = format!("{}\n{}", stdout, stderr);
+
+                if combined.contains("pwn3d") {
+                    ui::success("WinRM access confirmed — command execution possible!");
+                    let finding = Finding::new(
+                        "winrm",
+                        "WINRM-001",
+                        Severity::Critical,
+                        "WinRM command execution access (Pwn3d!)",
+                    )
+                    .with_description("Current credentials allow remote command execution via WinRM")
+                    .with_recommendation("Review and restrict WinRM access; implement JEA; use tiered admin model")
+                    .with_mitre("T1021.006");
+                    result.findings.push(finding);
+                } else if combined.contains("[+]") && combined.contains(&username.to_lowercase()) {
+                    ui::success("WinRM authentication successful");
+                    let finding = Finding::new(
+                        "winrm",
+                        "WINRM-002",
+                        Severity::High,
+                        "WinRM authentication successful",
+                    )
+                    .with_description("Credentials are valid for WinRM access")
+                    .with_mitre("T1021.006");
+                    result.findings.push(finding);
+                } else if combined.contains("logon_failure") || combined.contains("access_denied") {
+                    ui::info("WinRM authentication failed (credentials rejected)");
+                } else {
+                    ui::info(&format!("WinRM result: {}", combined.lines().next().unwrap_or("unknown")));
+                }
+                break;
+            }
+            Ok(Err(_)) => continue,
             Err(_) => {
-                found_any = true;
-                output::warning(&format!("{} winrm check timed out after 45s", bin));
-                continue;
+                ui::warning("WinRM check timed out");
+                break;
             }
-            Ok(Err(e)) if e.kind() == ErrorKind::NotFound => continue,
-            Ok(Err(e)) => {
-                found_any = true;
-                output::warning(&format!("Could not run {} ({})", bin, e));
-                continue;
-            }
-            Ok(Ok(out)) => out,
-        };
-
-        found_any = true;
-        let mut merged = String::new();
-        merged.push_str(&String::from_utf8_lossy(&out.stdout));
-        merged.push('\n');
-        merged.push_str(&String::from_utf8_lossy(&out.stderr));
-        let merged_trim = merged.trim();
-
-        if looks_success(merged_trim, username) {
-            output::success(&format!("{} winrm auth succeeded", bin));
-            if !merged_trim.is_empty() {
-                output::kv("WinRM Output", &trim_for_display(merged_trim, 220));
-            }
-            return (true, true);
-        }
-
-        if !merged_trim.is_empty() {
-            output::warning(&format!("{} winrm auth failed", bin));
-            output::kv("WinRM Output", &trim_for_display(merged_trim, 220));
         }
     }
 
-    (false, found_any)
-}
-
-fn looks_success(out: &str, username: &str) -> bool {
-    let l = out.to_ascii_lowercase();
-    let u = username.to_ascii_lowercase();
-
-    if l.contains("status_logon_failure")
-        || l.contains("access is denied")
-        || l.contains("authentication failed")
-        || l.contains("auth failed")
-        || l.contains("invalid credentials")
-    {
-        return false;
+    if !tested {
+        ui::info("No compatible WinRM tool found (nxc/netexec/crackmapexec)");
     }
 
-    l.contains("pwn3d") || l.contains("status_success") || (l.contains("[+]") && l.contains(&u))
-}
+    ui::finish_spinner(&spin, "WinRM check complete");
+    ui::stage_done("WINRM", "done", &timer.elapsed_pretty());
 
-fn trim_for_display(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let clipped = s.chars().take(max).collect::<String>();
-    format!("{} <snip>", clipped)
+    result = result.success(timer.elapsed());
+    Ok(result)
 }

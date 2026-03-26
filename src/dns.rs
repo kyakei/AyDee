@@ -1,192 +1,198 @@
 use anyhow::Result;
-use hickory_resolver::config::*;
+use hickory_resolver::config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts};
 use hickory_resolver::TokioAsyncResolver;
+use std::net::{IpAddr, SocketAddr};
+use std::time::Duration;
 
-use crate::output;
+use crate::types::{Finding, ModuleResult, Severity, StageTimer};
+use crate::ui;
 
-/// AD-specific SRV record queries to enumerate
+/// SRV records to query for AD services.
 const SRV_QUERIES: &[(&str, &str)] = &[
     ("_ldap._tcp.dc._msdcs", "Domain Controllers"),
     ("_kerberos._tcp", "Kerberos KDC"),
     ("_gc._tcp", "Global Catalog"),
     ("_kpasswd._tcp", "Kerberos Password Change"),
-    ("_ldap._tcp.pdc._msdcs", "Primary Domain Controller"),
-    ("_ldap._tcp.gc._msdcs", "Global Catalog (MSDCS)"),
+    ("_ldap._tcp.pdc._msdcs", "Primary DC"),
+    ("_ldap._tcp.gc._msdcs", "GC (MSDCS)"),
+    ("_kerberos._tcp.dc._msdcs", "KDC (MSDCS)"),
+    ("_ldap._tcp.ForestDnsZones", "Forest DNS Zones"),
+    ("_ldap._tcp.DomainDnsZones", "Domain DNS Zones"),
 ];
 
-/// Run DNS-based AD enumeration
-pub async fn run(target: &str) -> Result<Option<String>> {
-    output::section("DNS ENUMERATION");
+/// Run DNS enumeration against the target.
+pub async fn run(
+    target: &str,
+    domain: Option<&str>,
+) -> Result<(ModuleResult, Option<String>)> {
+    ui::section("DNS ENUMERATION");
+    let timer = StageTimer::start();
+    let spin = ui::spinner("DNS");
+    let mut result = ModuleResult::new("dns");
+    let mut discovered_domain: Option<String> = None;
 
-    let resolver = TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default());
-
-    output::info(&format!("Attempting domain discovery from {}", target));
-    let domain = discover_domain_from_target(target).await;
-    if let Some(ref d) = domain {
-        output::success(&format!("Domain: {}", d));
-    } else {
-        output::warning("Reverse DNS lookup failed");
+    // Step 1: try reverse DNS to discover domain
+    spin.set_message("reverse lookup...");
+    if let Some(hostname) = discover_domain_from_target(target).await {
+        ui::info(&format!("Reverse DNS: {} → {}", target, hostname));
+        if let Some(dom) = domain_from_hostname(&hostname) {
+            discovered_domain = Some(dom.clone());
+            ui::success(&format!("Discovered domain: {}", dom));
+        }
     }
 
-    // If we don't have a domain, we can't do SRV enumeration
-    let domain = match domain {
-        Some(d) => d,
-        None => {
-            output::warning("Could not determine domain name from DNS");
-            output::info("Try providing the domain with: ./aydee <ip> -d <domain>");
-            return Ok(None);
-        }
+    // Use provided domain or discovered domain
+    let domain = domain
+        .map(|d| d.to_string())
+        .or_else(|| discovered_domain.clone());
+
+    let Some(domain) = &domain else {
+        ui::finish_spinner_warn(&spin, "no domain available for SRV queries");
+        result = result.success(timer.elapsed());
+        return Ok((result, discovered_domain));
     };
 
-    // Enumerate SRV records
-    output::info(&format!("Enumerating SRV records for {}", domain));
-    println!();
+    // Step 2: create resolver pointing at target
+    let resolver = build_resolver(target)?;
 
-    for (srv, description) in SRV_QUERIES {
-        let query = format!("{}.{}.", srv, domain);
-        match resolver.srv_lookup(query.clone()).await {
+    // Step 3: SRV record queries
+    spin.set_message("querying SRV records...");
+    let mut total_records = 0u32;
+
+    for (srv, label) in SRV_QUERIES {
+        let fqdn = format!("{}.{}", srv, domain);
+        match resolver.srv_lookup(&fqdn).await {
             Ok(lookup) => {
-                output::success(description);
-                for record in lookup.iter() {
-                    output::kv(
-                        "Host",
-                        &format!(
-                            "{} (port: {}, priority: {}, weight: {})",
-                            record.target().to_string().trim_end_matches('.'),
-                            record.port(),
-                            record.priority(),
-                            record.weight()
-                        ),
-                    );
+                let records: Vec<String> = lookup
+                    .iter()
+                    .map(|r| {
+                        format!(
+                            "{}:{} (priority={}, weight={})",
+                            r.target(),
+                            r.port(),
+                            r.priority(),
+                            r.weight()
+                        )
+                    })
+                    .collect();
+                total_records += records.len() as u32;
+                if !records.is_empty() {
+                    ui::kv(label, &records.join(", "));
                 }
             }
-            Err(_) => {
-                output::fail(&format!("{} — no records", description));
-            }
+            Err(_) => {}
         }
     }
 
-    println!();
-    check_open_recursion(target).await;
+    // Step 4: check for open recursion
+    spin.set_message("checking open recursion...");
+    if check_open_recursion(&resolver).await {
+        let finding = Finding::new("dns", "DNS-001", Severity::Medium, "Open DNS recursion detected")
+            .with_description("The DNS server resolves external queries, which may allow cache poisoning or information leakage")
+            .with_recommendation("Disable recursive queries for external clients")
+            .with_mitre("T1557");
+        result.findings.push(finding);
+        ui::warning("Open DNS recursion detected — external queries resolved");
+    }
 
-    Ok(Some(domain))
+    // Step 5: attempt zone transfer
+    spin.set_message("attempting zone transfer...");
+    if let Ok(axfr_result) = attempt_zone_transfer(target, domain).await {
+        if axfr_result {
+            let finding = Finding::new(
+                "dns",
+                "DNS-002",
+                Severity::High,
+                "DNS zone transfer permitted",
+            )
+            .with_description("The DNS server allows zone transfers (AXFR), exposing all DNS records")
+            .with_recommendation("Restrict zone transfers to authorized secondary DNS servers only")
+            .with_mitre("T1590.002");
+            result.findings.push(finding);
+            ui::warning("Zone transfer (AXFR) appears to be permitted!");
+        }
+    }
+
+    ui::finish_spinner(&spin, &format!("{} SRV records found", total_records));
+    ui::stage_done("DNS", &format!("{} records", total_records), &timer.elapsed_pretty());
+
+    result = result.success(timer.elapsed());
+    Ok((result, discovered_domain))
 }
 
-/// Discover a likely AD domain from an IP/FQDN target.
-/// For IP targets, this performs reverse DNS and strips the host label.
-/// For FQDN targets, this strips the first label directly.
+/// Discover domain from target IP via reverse DNS.
 pub async fn discover_domain_from_target(target: &str) -> Option<String> {
-    // If target is an IP literal, don't treat dot-separated octets as a hostname.
-    if target.parse::<std::net::IpAddr>().is_err() {
-        if let Some(domain) = domain_from_hostname(target) {
-            return Some(domain);
-        }
-    }
-
+    let ip: IpAddr = target.parse().ok()?;
     let resolver = TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default());
+    let lookup = tokio::time::timeout(Duration::from_secs(5), resolver.reverse_lookup(ip))
+        .await
+        .ok()?
+        .ok()?;
 
-    let addr = target.parse::<std::net::IpAddr>().ok()?;
-    let lookup = resolver.reverse_lookup(addr).await.ok()?;
-    let hostname = lookup.iter().next()?.to_string();
-
-    domain_from_hostname(hostname.trim_end_matches('.'))
+    lookup
+        .iter()
+        .next()
+        .map(|name| name.to_string().trim_end_matches('.').to_string())
 }
 
-pub fn is_valid_domain_name(value: &str) -> bool {
-    let v = value.trim().trim_matches('.').to_ascii_lowercase();
-    if v.is_empty() {
-        return false;
-    }
-    if v.parse::<std::net::IpAddr>().is_ok() {
-        return false;
-    }
-    if !v.chars().any(|c| c.is_ascii_alphabetic()) {
-        return false;
-    }
-    let labels: Vec<&str> = v.split('.').collect();
-    if labels.iter().any(|l| l.is_empty()) {
-        return false;
-    }
-    for label in labels {
-        if label.len() > 63 {
-            return false;
-        }
-        if label.starts_with('-') || label.ends_with('-') {
-            return false;
-        }
-        if !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-            return false;
-        }
-    }
-    true
-}
-
-pub fn normalize_domain_name(value: &str) -> Option<String> {
-    let v = value.trim().trim_matches('.').to_ascii_lowercase();
-    if is_valid_domain_name(&v) {
-        Some(v)
+/// Extract domain from FQDN hostname.
+pub fn domain_from_hostname(hostname: &str) -> Option<String> {
+    let parts: Vec<&str> = hostname.split('.').collect();
+    if parts.len() >= 2 {
+        Some(parts[1..].join("."))
     } else {
         None
     }
 }
 
-/// Convert hostname/FQDN to a likely AD DNS domain:
-/// - `dc01.pirate.htb` -> `pirate.htb`
-/// - `pirate.htb` -> `pirate.htb`
-/// - `localhost` -> None
-pub fn domain_from_hostname(hostname: &str) -> Option<String> {
-    let h = hostname.trim().trim_matches('.').to_ascii_lowercase();
-    let parts: Vec<&str> = h.split('.').filter(|p| !p.is_empty()).collect();
-    let candidate = match parts.len() {
-        0 | 1 => return None,
-        2 => h,
-        _ => parts[1..].join("."),
-    };
-    normalize_domain_name(&candidate)
+/// Build a resolver pointing at the target as DNS server.
+fn build_resolver(target: &str) -> Result<TokioAsyncResolver> {
+    let ip: IpAddr = target.parse()?;
+    let ns = NameServerConfig::new(SocketAddr::new(ip, 53), Protocol::Udp);
+    let mut config = ResolverConfig::new();
+    config.add_name_server(ns);
+    let mut opts = ResolverOpts::default();
+    opts.timeout = Duration::from_secs(5);
+    opts.attempts = 2;
+    Ok(TokioAsyncResolver::tokio(config, opts))
 }
 
-/// Prefer a better domain candidate.
-/// - invalid current -> replace with valid candidate
-/// - if both valid and candidate is more specific (`pirate.htb` over `htb`) -> replace
-pub fn should_replace_domain(current: &str, candidate: &str) -> bool {
-    let Some(cur) = normalize_domain_name(current) else {
-        return true;
-    };
-    let Some(cand) = normalize_domain_name(candidate) else {
-        return false;
-    };
-    if cur == cand {
-        return false;
-    }
-    let cur_labels = cur.split('.').count();
-    let cand_labels = cand.split('.').count();
-    if cand_labels > cur_labels && cand.ends_with(&format!(".{}", cur)) {
-        return true;
+/// Check if the DNS server resolves external queries (open recursion).
+async fn check_open_recursion(resolver: &TokioAsyncResolver) -> bool {
+    // Try to resolve an external domain — if it works, recursion is open
+    let test_domains = ["www.google.com.", "www.cloudflare.com."];
+    for domain in test_domains {
+        if let Ok(lookup) = tokio::time::timeout(
+            Duration::from_secs(3),
+            resolver.lookup_ip(domain),
+        )
+        .await
+        {
+            if lookup.is_ok() {
+                return true;
+            }
+        }
     }
     false
 }
 
-async fn check_open_recursion(target: &str) {
-    let Ok(ip) = target.parse::<std::net::IpAddr>() else {
-        return;
-    };
+/// Attempt a DNS zone transfer using dig.
+async fn attempt_zone_transfer(target: &str, domain: &str) -> Result<bool> {
+    let output = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::process::Command::new("dig")
+            .args(["axfr", domain, &format!("@{}", target)])
+            .output(),
+    )
+    .await??;
 
-    let ns_group = NameServerConfigGroup::from_ips_clear(&[ip], 53, true);
-    let resolver = TokioAsyncResolver::tokio(
-        ResolverConfig::from_parts(None, vec![], ns_group),
-        ResolverOpts::default(),
-    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    ui::verbose_output("dig", &stdout);
+    // If we get actual records back (not just SOA or error), transfer succeeded
+    let record_count = stdout
+        .lines()
+        .filter(|l| !l.starts_with(';') && !l.is_empty() && l.contains('\t'))
+        .count();
 
-    output::info("Testing DNS recursion behavior (unauthenticated query)...");
-    match resolver.lookup_ip("www.microsoft.com.").await {
-        Ok(ips) if ips.iter().next().is_some() => {
-            output::warning(
-                "Potential open recursion: target DNS resolved external name for unauthenticated query",
-            );
-            output::info("Verify recursion ACL policy before treating this as exposure");
-        }
-        _ => {
-            output::success("No obvious open-recursion response for external lookup");
-        }
-    }
+    Ok(record_count > 2) // More than just SOA records
 }

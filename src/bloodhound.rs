@@ -1,212 +1,165 @@
 use anyhow::Result;
-use serde::Serialize;
 use std::fs::File;
+use std::io::IsTerminal;
 use std::io::ErrorKind;
 use std::path::Path;
+use std::process::Stdio;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::time::{timeout, Duration};
 use zip::read::ZipArchive;
 
-use crate::output;
+use crate::types::{ModuleResult, StageTimer};
+use crate::ui;
 
-#[derive(Debug, Clone, Serialize)]
-struct BloodHoundZipSummary {
-    path: String,
-    size_bytes: u64,
-    json_entries: usize,
-    entry_kinds: Vec<String>,
-}
+const BLOODHOUND_TIMEOUT_SECS: u64 = 180;
 
-#[derive(Debug, Clone, Serialize)]
-struct BloodHoundSummary {
-    output_dir: String,
-    zip_count: usize,
-    zips: Vec<BloodHoundZipSummary>,
-}
-
-/// Run BloodHound collection using available auth methods.
-pub async fn run_collection(
-    target: &str,
-    domain: &str,
-    username: &str,
-    password: Option<&str>,
-    ntlm_hash: Option<&str>,
-    kerberos: bool,
-    collection: &str,
-) -> Result<bool> {
-    let output_dir = "bloodhound_output";
-    let mut attempted = false;
-    let mut any_success = false;
-    let mut installed = false;
-
-    output::section("BLOODHOUND COLLECTION");
-    output::info(&format!(
-        "Attempting BloodHound collection with --collection {} --zip",
-        collection
-    ));
-
-    if let Some(pass) = password {
-        attempted = true;
-        let (ok, found_binary) =
-            run_password(target, domain, username, pass, collection, output_dir).await?;
-        installed |= found_binary;
-        if ok {
-            any_success = true;
-        }
-    }
-
-    if let Some(hash) = ntlm_hash {
-        attempted = true;
-        let (ok, found_binary) =
-            run_ntlm(target, domain, username, hash, collection, output_dir).await?;
-        installed |= found_binary;
-        if ok {
-            any_success = true;
-        }
-    }
-
-    if kerberos {
-        attempted = true;
-        let (ok, found_binary) =
-            run_kerberos(target, domain, username, collection, output_dir).await?;
-        installed |= found_binary;
-        if ok {
-            any_success = true;
-        }
-    }
-
-    if !attempted {
-        output::warning("No BloodHound auth method provided (--password, --ntlm, or --kerberos)");
-        Ok(false)
-    } else if !installed {
-        output::warning(
-            "No BloodHound collector binary found (tried: bloodhound-python, bloodhound-ce-python)",
-        );
-        Ok(false)
-    } else if any_success {
-        summarize_output_dir(output_dir);
-        output::success(&format!(
-            "BloodHound collection completed. Zip output should be in ./{}/",
-            output_dir
-        ));
-        Ok(true)
-    } else {
-        output::warning("BloodHound methods were attempted, but no collection succeeded");
-        Ok(false)
-    }
-}
-
-async fn run_password(
+/// Run BloodHound data collection.
+pub async fn run(
     target: &str,
     domain: &str,
     username: &str,
     password: &str,
+    ntlm: Option<&str>,
+    kerberos: bool,
     collection: &str,
     output_dir: &str,
-) -> Result<(bool, bool)> {
-    output::info("BloodHound auth method: password");
-    let (ok, found) = run_with_candidates(
-        target,
-        domain,
-        username,
-        collection,
-        output_dir,
-        &[("-p", password)],
-        &[],
-    )
-    .await?;
-    if ok || !found {
-        return Ok((ok, found));
-    }
-    output::info("Retrying BloodHound password method with --dns-tcp");
-    let (ok2, found2) = run_with_candidates(
-        target,
-        domain,
-        username,
-        collection,
-        output_dir,
-        &[("-p", password)],
-        &["--dns-tcp"],
-    )
-    .await?;
-    Ok((ok || ok2, found || found2))
-}
+    non_interactive: bool,
+) -> Result<ModuleResult> {
+    ui::section("BLOODHOUND COLLECTION");
+    let timer = StageTimer::start();
+    let mut result = ModuleResult::new("bloodhound");
 
-async fn run_ntlm(
-    target: &str,
-    domain: &str,
-    username: &str,
-    ntlm_hash: &str,
-    collection: &str,
-    output_dir: &str,
-) -> Result<(bool, bool)> {
-    output::info("BloodHound auth method: NTLM hash");
-    let hashes = if ntlm_hash.contains(':') {
-        ntlm_hash.to_string()
+    if !non_interactive && std::io::stdin().is_terminal() {
+        let confirm = dialoguer::Confirm::new()
+            .with_prompt("  Run BloodHound collection?")
+            .default(true)
+            .interact_opt()
+            .unwrap_or(Some(true))
+            .unwrap_or(true);
+        if !confirm {
+            ui::info("BloodHound collection skipped");
+            result = result.skipped("user declined");
+            return Ok(result);
+        }
+    }
+
+    let spin = ui::spinner("BLOODHOUND");
+
+    let bh_dir = format!("{}/bloodhound_output", output_dir);
+    tokio::fs::create_dir_all(&bh_dir).await?;
+
+    let mut attempted = false;
+    let mut any_success = false;
+    let mut installed = false;
+
+    // Try password auth
+    if !password.is_empty() {
+        attempted = true;
+        spin.set_message("collecting with password auth...");
+        let (ok, found) = run_with_candidates(
+            target, domain, username, collection, &bh_dir,
+            &[("-p", password)],
+            &[],
+        ).await;
+        installed |= found;
+        if ok {
+            any_success = true;
+        } else if found {
+            // Retry with --dns-tcp
+            spin.set_message("retrying with --dns-tcp...");
+            let (ok2, _) = run_with_candidates(
+                target, domain, username, collection, &bh_dir,
+                &[("-p", password)],
+                &["--dns-tcp"],
+            ).await;
+            if ok2 { any_success = true; }
+        }
+    }
+
+    // Try NTLM hash
+    if !any_success {
+        if let Some(hash) = ntlm {
+            attempted = true;
+            spin.set_message("collecting with NTLM hash...");
+            let hashes = if hash.contains(':') {
+                hash.to_string()
+            } else {
+                format!("aad3b435b51404eeaad3b435b51404ee:{}", hash)
+            };
+            let (ok, found) = run_with_candidates(
+                target, domain, username, collection, &bh_dir,
+                &[("--hashes", &hashes)],
+                &[],
+            ).await;
+            installed |= found;
+            if ok {
+                any_success = true;
+            } else if found {
+                spin.set_message("retrying NTLM with --dns-tcp...");
+                let (ok2, _) = run_with_candidates(
+                    target, domain, username, collection, &bh_dir,
+                    &[("--hashes", &hashes)],
+                    &["--dns-tcp"],
+                ).await;
+                if ok2 { any_success = true; }
+            }
+        }
+    }
+
+    // Try Kerberos
+    if !any_success && kerberos {
+        attempted = true;
+        spin.set_message("collecting with Kerberos...");
+        let (ok, found) = run_with_candidates(
+            target, domain, username, collection, &bh_dir,
+            &[],
+            &["-k"],
+        ).await;
+        installed |= found;
+        if ok {
+            any_success = true;
+        } else if found {
+            spin.set_message("retrying Kerberos with --dns-tcp...");
+            let (ok2, _) = run_with_candidates(
+                target, domain, username, collection, &bh_dir,
+                &[],
+                &["-k", "--dns-tcp"],
+            ).await;
+            if ok2 { any_success = true; }
+        }
+    }
+
+    if !attempted {
+        ui::finish_spinner_warn(&spin, "no auth method available for BloodHound");
+        result = result.skipped("no auth");
+        return Ok(result);
+    }
+
+    if !installed {
+        ui::finish_spinner_warn(&spin, "bloodhound-python not installed");
+        ui::info("Install: pip install bloodhound or pip install bloodhound-ce");
+        result = result.skipped("tool not found");
+        return Ok(result);
+    }
+
+    if any_success {
+        spin.set_message("inspecting output...");
+        let summary = summarize_output_dir(&bh_dir);
+        ui::finish_spinner(&spin, &format!("collection complete — {}", summary));
+        ui::kv("Output", &bh_dir);
     } else {
-        format!("aad3b435b51404eeaad3b435b51404ee:{}", ntlm_hash)
-    };
-    let (ok, found) = run_with_candidates(
-        target,
-        domain,
-        username,
-        collection,
-        output_dir,
-        &[("--hashes", &hashes)],
-        &[],
-    )
-    .await?;
-    if ok || !found {
-        return Ok((ok, found));
+        ui::finish_spinner_fail(&spin, "collection failed — all methods attempted");
+        result = result.failed("all methods failed", timer.elapsed());
+        return Ok(result);
     }
-    output::info("Retrying BloodHound NTLM method with --dns-tcp");
-    let (ok2, found2) = run_with_candidates(
-        target,
-        domain,
-        username,
-        collection,
-        output_dir,
-        &[("--hashes", &hashes)],
-        &["--dns-tcp"],
-    )
-    .await?;
-    Ok((ok || ok2, found || found2))
+
+    ui::stage_done("BLOODHOUND", "collected", &timer.elapsed_pretty());
+    result = result.success(timer.elapsed());
+    Ok(result)
 }
 
-async fn run_kerberos(
-    target: &str,
-    domain: &str,
-    username: &str,
-    collection: &str,
-    output_dir: &str,
-) -> Result<(bool, bool)> {
-    output::info("BloodHound auth method: Kerberos (-k)");
-    let (ok, found) = run_with_candidates(
-        target,
-        domain,
-        username,
-        collection,
-        output_dir,
-        &[],
-        &["-k"],
-    )
-    .await?;
-    if ok || !found {
-        return Ok((ok, found));
-    }
-    output::info("Retrying BloodHound Kerberos method with --dns-tcp");
-    let (ok2, found2) = run_with_candidates(
-        target,
-        domain,
-        username,
-        collection,
-        output_dir,
-        &[],
-        &["-k", "--dns-tcp"],
-    )
-    .await?;
-    Ok((ok || ok2, found || found2))
-}
+// ── Runner ─────────────────────────────────────────────────────────────────
 
 fn base_cmd(
     bin: &str,
@@ -217,17 +170,12 @@ fn base_cmd(
     output_dir: &str,
 ) -> Command {
     let mut cmd = Command::new(bin);
-    cmd.arg("-u")
-        .arg(username)
-        .arg("-d")
-        .arg(domain)
-        .arg("-ns")
-        .arg(target)
-        .arg("-c")
-        .arg(collection)
+    cmd.arg("-u").arg(username)
+        .arg("-d").arg(domain)
+        .arg("-ns").arg(target)
+        .arg("-c").arg(collection)
         .arg("--zip")
-        .arg("-o")
-        .arg(output_dir);
+        .arg("-o").arg(output_dir);
     cmd
 }
 
@@ -239,7 +187,7 @@ async fn run_with_candidates(
     output_dir: &str,
     kv_args: &[(&str, &str)],
     flag_args: &[&str],
-) -> Result<(bool, bool)> {
+) -> (bool, bool) {
     let bins = ["bloodhound-python", "bloodhound-ce-python"];
     let mut found_any = false;
 
@@ -252,103 +200,169 @@ async fn run_with_candidates(
             cmd.arg(f);
         }
 
-        match timeout(Duration::from_secs(120), cmd.output()).await {
-            Err(_) => {
+        // Spawn with piped output so we can stream lines live
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+        ui::verbose(&format!("running: {} ...", bin));
+
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                if e.kind() == ErrorKind::NotFound {
+                    ui::verbose(&format!("{} not found, skipping", bin));
+                    continue;
+                }
+                ui::warning(&format!("Could not run {}: {}", bin, e));
                 found_any = true;
-                output::warning(&format!("{} method timed out after 120s", bin));
+                continue;
+            }
+        };
+
+        found_any = true;
+
+        // Stream stdout and stderr live
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let bin_name = bin.to_string();
+
+        let stdout_handle = tokio::spawn({
+            let label = bin_name.clone();
+            async move {
+                let mut lines = Vec::new();
+                if let Some(out) = stdout {
+                    let mut reader = BufReader::new(out).lines();
+                    while let Ok(Some(line)) = reader.next_line().await {
+                        ui::verbose(&format!("{}: {}", label, line));
+                        lines.push(line);
+                    }
+                }
+                lines
+            }
+        });
+
+        let stderr_handle = tokio::spawn({
+            let label = bin_name.clone();
+            async move {
+                let mut lines = Vec::new();
+                if let Some(err) = stderr {
+                    let mut reader = BufReader::new(err).lines();
+                    while let Ok(Some(line)) = reader.next_line().await {
+                        ui::verbose(&format!("{}: {}", label, line));
+                        lines.push(line);
+                    }
+                }
+                lines
+            }
+        });
+
+        let wait_result = timeout(
+            Duration::from_secs(BLOODHOUND_TIMEOUT_SECS),
+            child.wait(),
+        ).await;
+
+        let _stdout_lines = stdout_handle.await.unwrap_or_default();
+        let stderr_lines = stderr_handle.await.unwrap_or_default();
+
+        match wait_result {
+            Err(_) => {
+                ui::warning(&format!("{} timed out after {}s", bin, BLOODHOUND_TIMEOUT_SECS));
+                // Kill the timed-out process
+                let _ = child.kill().await;
                 continue;
             }
             Ok(Err(e)) => {
-                if e.kind() == ErrorKind::NotFound {
-                    continue;
-                }
-                output::warning(&format!("Could not run {} ({})", bin, e));
-                found_any = true;
+                ui::warning(&format!("{} wait error: {}", bin, e));
                 continue;
             }
-            Ok(Ok(out)) => {
-                found_any = true;
-                if out.status.success() {
-                    output::success(&format!("{} method succeeded", bin));
-                    return Ok((true, true));
+            Ok(Ok(status)) => {
+                if status.success() {
+                    ui::success(&format!("{} collection succeeded", bin));
+                    return (true, true);
                 }
 
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                output::warning(&format!(
-                    "{} method failed (exit {:?})",
-                    bin,
-                    out.status.code()
-                ));
-                if !stderr.trim().is_empty() {
-                    output::kv("stderr", stderr.trim());
-                } else if !stdout.trim().is_empty() {
-                    output::kv("stdout", stdout.trim());
+                ui::verbose(&format!("{} failed (exit {:?})", bin, status.code()));
+                if !stderr_lines.is_empty() {
+                    if let Some(last) = stderr_lines.last() {
+                        ui::info(&format!("{}: {}", bin, truncate(last.trim(), 80)));
+                    }
                 }
             }
         }
     }
 
-    Ok((false, found_any))
+    (false, found_any)
 }
 
-fn summarize_output_dir(output_dir: &str) {
+// ── Output inspection ──────────────────────────────────────────────────────
+
+fn summarize_output_dir(output_dir: &str) -> String {
     let path = Path::new(output_dir);
     let Ok(entries) = std::fs::read_dir(path) else {
-        output::warning("BloodHound output directory could not be inspected");
-        return;
+        return "output dir not readable".to_string();
     };
 
-    let mut summaries = Vec::new();
+    let mut zip_count = 0usize;
+    let mut total_json = 0usize;
+    let mut all_kinds: Vec<String> = Vec::new();
+
     for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(meta) = entry.metadata() else {
-            continue;
-        };
-        if !meta.is_file() {
-            continue;
-        }
-        if path
+        let entry_path = entry.path();
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() { continue; }
+
+        let is_zip = entry_path
             .extension()
             .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
-        {
-            summaries.push(inspect_zip(&path, meta.len()));
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"));
+
+        if is_zip {
+            zip_count += 1;
+            if let Some(info) = inspect_zip(&entry_path, meta.len()) {
+                total_json += info.json_entries;
+                all_kinds.extend(info.entry_kinds);
+
+                ui::kv(
+                    "  Zip",
+                    &format!(
+                        "{} ({} bytes, {} JSON entries)",
+                        entry_path.display(), info.size_bytes, info.json_entries
+                    ),
+                );
+            }
         }
     }
 
-    let summaries = summaries.into_iter().flatten().collect::<Vec<_>>();
-    if summaries.is_empty() {
-        output::warning("BloodHound reported success, but no zip artifact was found yet");
-        return;
+    all_kinds.sort();
+    all_kinds.dedup();
+
+    if !all_kinds.is_empty() {
+        ui::kv("  Kinds", &all_kinds.join(", "));
     }
 
-    output::success(&format!("BloodHound zip artifacts: {}", summaries.len()));
-    for summary in summaries.iter().take(5) {
-        output::kv(
-            "Zip",
-            &format!(
-                "{} ({} bytes, {} JSON entries)",
-                summary.path, summary.size_bytes, summary.json_entries
-            ),
-        );
-        if !summary.entry_kinds.is_empty() {
-            output::kv("Kinds", &summary.entry_kinds.join(", "));
+    // Write summary JSON
+    if zip_count > 0 {
+        let summary_path = Path::new(output_dir).join("collection_summary.json");
+        let summary = serde_json::json!({
+            "output_dir": output_dir,
+            "zip_count": zip_count,
+            "total_json_entries": total_json,
+            "entry_kinds": all_kinds,
+        });
+        if let Ok(json) = serde_json::to_string_pretty(&summary) {
+            let _ = std::fs::write(summary_path, json);
         }
     }
 
-    let summary = BloodHoundSummary {
-        output_dir: output_dir.to_string(),
-        zip_count: summaries.len(),
-        zips: summaries,
-    };
-    let summary_path = Path::new(output_dir).join("collection_summary.json");
-    if let Ok(json) = serde_json::to_string_pretty(&summary) {
-        let _ = std::fs::write(summary_path, json);
-    }
+    format!("{} zip(s), {} JSON entries", zip_count, total_json)
 }
 
-fn inspect_zip(path: &Path, size_bytes: u64) -> Option<BloodHoundZipSummary> {
+struct ZipInfo {
+    size_bytes: u64,
+    json_entries: usize,
+    entry_kinds: Vec<String>,
+}
+
+fn inspect_zip(path: &Path, size_bytes: u64) -> Option<ZipInfo> {
     let file = File::open(path).ok()?;
     let mut archive = ZipArchive::new(file).ok()?;
     let mut json_entries = 0usize;
@@ -368,8 +382,7 @@ fn inspect_zip(path: &Path, size_bytes: u64) -> Option<BloodHoundZipSummary> {
     entry_kinds.sort();
     entry_kinds.dedup();
 
-    Some(BloodHoundZipSummary {
-        path: path.display().to_string(),
+    Some(ZipInfo {
         size_bytes,
         json_entries,
         entry_kinds,
@@ -386,4 +399,12 @@ fn classify_entry_kind(name: &str) -> Option<String> {
         .map(|(_, suffix)| suffix)
         .unwrap_or(file);
     Some(kind.to_string())
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..max])
+    }
 }

