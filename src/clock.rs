@@ -30,8 +30,8 @@ pub async fn sync_clock(target: &str, non_interactive: bool) {
     let spin = ui::spinner("CLOCK");
     spin.set_message(format!("syncing with {} ...", target));
 
-    // Detect if we're already root
-    let is_root = unsafe { libc::geteuid() } == 0;
+    // Detect if we're already root on Unix. On other hosts, treat this as non-privileged.
+    let is_root = is_elevated();
 
     if is_root {
         // Already root — just run directly
@@ -170,6 +170,18 @@ async fn try_sync_sudo(target: &str, password: &str, spin: &indicatif::ProgressB
         }
     }
     false
+}
+
+fn is_elevated() -> bool {
+    #[cfg(unix)]
+    {
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    #[cfg(not(unix))]
+    {
+        false
+    }
 }
 
 fn truncate(s: &str, max: usize) -> String {
