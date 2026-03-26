@@ -3,6 +3,12 @@ name = "aydee"
 version = "2.0.0"
 edition = "2021"
 description = "Active Directory enumeration and reconnaissance toolkit"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/kyakei/AyDee"
+homepage = "https://github.com/kyakei/AyDee"
+keywords = ["active-directory", "ldap", "kerberos", "bloodhound", "pentest"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 # CLI
