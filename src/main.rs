@@ -26,7 +26,7 @@ use types::{AuthMethod, AuthStrategy, LdapInfo, ModuleResult, RunMode};
 // ── CLI arguments ───────────────────────────────────────────────────────────
 
 #[derive(Parser)]
-#[command(name = "aydee", version = "2.0.0")]
+#[command(name = "aydee", version = "2.1.0")]
 #[command(about = "Active Directory enumeration and reconnaissance toolkit")]
 struct Args {
     /// Target DC IP or hostname
